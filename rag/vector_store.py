@@ -93,8 +93,9 @@ class SparseEncoder:
 
     @staticmethod
     def _token_id(token: str) -> int:
-        """将 token 字符串映射到非负整数 id。"""
-        return abs(hash(token)) % (2**31)
+        """将 token 字符串映射到非负整数 id（使用稳定哈希）。"""
+        import hashlib
+        return int(hashlib.md5(token.encode("utf-8")).hexdigest()[:8], 16) % (2**31)
 
     def encode(self, text: str) -> Tuple[List[int], List[float]]:
         """

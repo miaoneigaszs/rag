@@ -212,9 +212,10 @@ class ContextualRetrieval:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _cache_key(content: str) -> str:
-        """以内容前 500 字符的 SHA-256 作为缓存键。"""
-        return hashlib.sha256(content[:500].encode()).hexdigest()
+    def _cache_key(content: str, heading_str: str = "") -> str:
+        """结合标题和内容前缀的 SHA-256 作为缓存键，降低不同段落间相似前缀的碰撞风险。"""
+        raw = f"{heading_str}::{content[:500]}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     # ------------------------------------------------------------------
     # 单条生成
@@ -222,7 +223,7 @@ class ContextualRetrieval:
 
     def generate_context(self, chunk_content: str, heading_str: str) -> str:
         """为单个 chunk 生成上下文摘要（同步，带持久化缓存）。"""
-        key = self._cache_key(chunk_content)
+        key = self._cache_key(chunk_content, heading_str)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
@@ -268,7 +269,7 @@ class ContextualRetrieval:
         sem = threading.Semaphore(self._max_concurrency)
 
         # 批量预检缓存命中（减少 N+1 问题：一次遍历构建 key 列表，逐一查询但在本地完成）
-        keys = [self._cache_key(c.content) for c in chunks]
+        keys = [self._cache_key(c.content, c.heading_str) for c in chunks]
         cached_flags = [self._cache.get(k) is not None for k in keys]
         cache_hits = sum(cached_flags)
 
