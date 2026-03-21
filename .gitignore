@@ -1,10 +1,41 @@
-# Python-generated files
+# --- Python-generated files ---
 __pycache__/
 *.py[oc]
+*.so
 build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Virtual environments
-.venv
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.history/
+
+# --- Environment Secrets (CRITICAL) ---
+.env
+.env.*
+!.env.example
+
+# --- RAG Project Data & Caches ---
+# 向量数据库本地存储 (Qdrant)
+qdrant_data/
+# Contextual Retrieval 摘要缓存 (DiskCache)
+contextual_cache/
+# 解析过程中从 PDF/PPT 提取出的图片目录
+# (匹配模式: 文件名_images/)
+*_images/
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db

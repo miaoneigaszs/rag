@@ -8,6 +8,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    # 自动搜索当前目录或父目录中的 .env 文件并加载
+    load_dotenv()
+except ImportError:
+    pass
 
 
 # ---------------------------------------------------------------------------

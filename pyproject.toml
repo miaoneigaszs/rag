@@ -4,4 +4,19 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "diskcache>=5.6.3",
+    "docling>=2.81.0",
+    "loguru>=0.7.3",
+    "openai>=2.29.0",
+    "pillow>=12.1.1",
+    "pydantic>=2.12.5",
+    "python-docx>=1.2.0",
+    "python-dotenv>=1.2.2",
+    "python-magic>=0.4.27",
+    "python-pptx>=1.0.2",
+    "qdrant-client>=1.17.1",
+    "redis>=7.3.0",
+    "tqdm>=4.67.3",
+    "unstructured[all-docs]>=0.21.5",
+]
