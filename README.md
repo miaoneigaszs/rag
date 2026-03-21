@@ -1,7 +1,6 @@
 # Industrial RAG Pipeline v2.0
 
-工业级 RAG Pipeline，从单文件重构为模块化 Python 包。
-
+工业级 RAG Pipeline
 ## 目录结构
 
 ```
