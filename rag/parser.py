@@ -109,18 +109,17 @@ class DocumentParser:
             import os
             import base64
             from openai import OpenAI
-            
-            # 使用环境变量配置多模态模型，默认回退到通用 OpenAI 配置
+
             api_key = os.getenv("VISION_API_KEY", os.getenv("OPENAI_API_KEY"))
             base_url = os.getenv("VISION_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
             model = os.getenv("VISION_MODEL", "gpt-4o-mini")
-            
+
             if not api_key:
                 return "未配置 Vision API Key，跳过图片描述。"
-                
+
             client = OpenAI(api_key=api_key, base_url=base_url)
             base64_image = base64.b64encode(image_bytes).decode('utf-8')
-            
+
             response = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -146,80 +145,89 @@ class DocumentParser:
 
     def _parse_with_docling(self, file_path: str) -> Optional[str]:
         """使用 Docling 解析，返回 Markdown 文本；支持图片提取和多模态描述。"""
+        # Docling 导出的图片占位符固定为该字符串，不含任何 ID
+        IMAGE_PLACEHOLDER = "<!-- image -->"
+
         try:
             from docling.document_converter import DocumentConverter, PdfFormatOption
             from docling.datamodel.pipeline_options import PdfPipelineOptions
             from docling.datamodel.base_models import InputFormat
-            
+
             # 配置 PDF 提取图片
             pipeline_options = PdfPipelineOptions()
-            pipeline_options.images_scale = 1.0  # 下调缩放比例，防止内存溢出 (bad allocation)
+            pipeline_options.images_scale = 1.0
             pipeline_options.generate_page_images = False
             pipeline_options.generate_picture_images = True
-            
+
             converter = DocumentConverter(
                 allowed_formats=[InputFormat.PDF, InputFormat.DOCX, InputFormat.HTML, InputFormat.PPTX],
                 format_options={
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
                 }
             )
-            
+
             result = converter.convert(file_path)
-            
-            # 导出带有图片占位符的 Markdown (需要引入 ImageRefMode，如果不存在则回退为默认导出)
+
+            # 导出 Markdown，优先使用 PLACEHOLDER 模式
             try:
-                from docling.datamodel.base_models import ImageRefMode
+                from docling_core.types.doc.base import ImageRefMode
                 md_text = result.document.export_to_markdown(image_mode=ImageRefMode.PLACEHOLDER)
             except ImportError:
                 md_text = result.document.export_to_markdown()
-            
-            # 保存并处理图片
-            image_dir = Path(file_path).parent / f"{Path(file_path).stem}_images"
-            
-            # 遍历文档中的图片元素
+
+            # ── 图片处理：按顺序替换占位符 ──────────────────────────────────
+            # 占位符格式为固定的 <!-- image -->，不含 ID，必须按遍历顺序
+            # 逐个替换（str.replace 第三参数 count=1），保证位置一一对应。
             if hasattr(result.document, "pictures") and result.document.pictures:
-                if not image_dir.exists():
-                    image_dir.mkdir(parents=True, exist_ok=True)
-                    
+                image_dir = Path(file_path).parent / f"{Path(file_path).stem}_images"
+                image_dir.mkdir(parents=True, exist_ok=True)
+
                 for i, pic_obj in enumerate(result.document.pictures):
                     try:
-                        # 修复：新版 PictureItem 使用 self_ref 而非 id
-                        # 尝试从 self_ref 提取 ID，如果失败则使用索引 i
-                        p_id = getattr(pic_obj, "self_ref", f"#/picture/{i}").split("/")[-1]
-                        
-                        # 尝试获取 PIL Image
+                        # self_ref 形如 "#/pictures/0"，取最后一段作为文件名
+                        p_id = getattr(pic_obj, "self_ref", f"picture_{i}").split("/")[-1]
                         img = pic_obj.get_image(result.document)
+
                         if img:
                             img_filename = f"image_{p_id}.png"
                             img_path = image_dir / img_filename
                             img.save(img_path)
-                            
-                            # 转换为 bytes 用于大模型
+
                             import io
                             buffered = io.BytesIO()
                             img.save(buffered, format="PNG")
                             img_bytes = buffered.getvalue()
-                            
-                            # 获取大模型多模态描述
+
                             caption = self._get_image_caption(img_bytes)
-                            
                             replacement = (
                                 f"\n\n> 🖼️ **图片内容信息** ({img_filename}):\n"
                                 f"> {caption}\n"
                                 f"> (图片本地路径: `{img_path.resolve()}`)\n\n"
                             )
-                            
-                            # 尝试替换占位符（格式类似于 <!-- image: p_id -->）
-                            placeholder = f"<!-- image: {p_id} -->"
-                            if placeholder in md_text:
-                                md_text = md_text.replace(placeholder, replacement)
-                            else:
+                        else:
+                            # 取到了 PictureItem 但无图像数据，用空白替换占位符
+                            replacement = ""
+
+                        if IMAGE_PLACEHOLDER in md_text:
+                            # count=1：只替换第一个，保证顺序与 pictures 列表一致
+                            md_text = md_text.replace(IMAGE_PLACEHOLDER, replacement, 1)
+                        else:
+                            # 占位符已耗尽（文档图片数 > 占位符数），追加到末尾
+                            if replacement:
                                 md_text += replacement
+
                     except Exception as img_exc:
-                        logger.warning(f"处理图片 {getattr(pic_obj, 'self_ref', 'unknown')} 失败: {img_exc}")
-            
+                        logger.warning(f"[Docling] 处理图片 {i} 失败: {img_exc}")
+                        # 失败时也要消耗掉对应占位符，避免后续图片错位
+                        md_text = md_text.replace(
+                            IMAGE_PLACEHOLDER,
+                            f"\n\n> ⚠️ 图片 {i} 处理失败\n\n",
+                            1,
+                        )
+
             logger.debug(f"[Docling] 解析成功: {Path(file_path).name}, 长度={len(md_text)}")
             return md_text
+
         except Exception as exc:
             logger.warning(f"[Docling] 解析异常: {exc}")
             return None
