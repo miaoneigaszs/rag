@@ -153,7 +153,7 @@ class DocumentParser:
             
             # 配置 PDF 提取图片
             pipeline_options = PdfPipelineOptions()
-            pipeline_options.images_scale = 2.0
+            pipeline_options.images_scale = 1.0  # 下调缩放比例，防止内存溢出 (bad allocation)
             pipeline_options.generate_page_images = False
             pipeline_options.generate_picture_images = True
             
@@ -176,22 +176,25 @@ class DocumentParser:
             # 保存并处理图片
             image_dir = Path(file_path).parent / f"{Path(file_path).stem}_images"
             
-            # 遍历文档中的图片元素 (兼容 Docling 的图表和照片对象)
-            # docling v2 中图片可通过 result.document.pictures 获取，或者直接遍历元素的 image 属性
+            # 遍历文档中的图片元素
             if hasattr(result.document, "pictures") and result.document.pictures:
                 if not image_dir.exists():
                     image_dir.mkdir(parents=True, exist_ok=True)
                     
-                for pic_obj in result.document.pictures:
+                for i, pic_obj in enumerate(result.document.pictures):
                     try:
+                        # 修复：新版 PictureItem 使用 self_ref 而非 id
+                        # 尝试从 self_ref 提取 ID，如果失败则使用索引 i
+                        p_id = getattr(pic_obj, "self_ref", f"#/picture/{i}").split("/")[-1]
+                        
                         # 尝试获取 PIL Image
                         img = pic_obj.get_image(result.document)
                         if img:
-                            img_filename = f"image_{pic_obj.id}.png"
+                            img_filename = f"image_{p_id}.png"
                             img_path = image_dir / img_filename
                             img.save(img_path)
                             
-                            # 转换为 bytes
+                            # 转换为 bytes 用于大模型
                             import io
                             buffered = io.BytesIO()
                             img.save(buffered, format="PNG")
@@ -206,14 +209,14 @@ class DocumentParser:
                                 f"> (图片本地路径: `{img_path.resolve()}`)\n\n"
                             )
                             
-                            # 尝试替换占位符（格式类似于 <!-- image: id -->），如果找不到则附加到末尾
-                            placeholder = f"<!-- image: {pic_obj.id} -->"
+                            # 尝试替换占位符（格式类似于 <!-- image: p_id -->）
+                            placeholder = f"<!-- image: {p_id} -->"
                             if placeholder in md_text:
                                 md_text = md_text.replace(placeholder, replacement)
                             else:
                                 md_text += replacement
                     except Exception as img_exc:
-                        logger.warning(f"处理图片 {getattr(pic_obj, 'id', 'unknown')} 失败: {img_exc}")
+                        logger.warning(f"处理图片 {getattr(pic_obj, 'self_ref', 'unknown')} 失败: {img_exc}")
             
             logger.debug(f"[Docling] 解析成功: {Path(file_path).name}, 长度={len(md_text)}")
             return md_text

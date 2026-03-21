@@ -8,6 +8,8 @@ python-dotenv
 qdrant-client
 openai
 pydantic
+tenacity
+httpx
 
 # 图片处理与多模态
 pillow
@@ -19,3 +21,5 @@ python-docx   # 处理 DOCX 所需
 redis         # 如果开启了 Redis 缓存后端
 diskcache     # 默认的磁盘缓存后端
 tqdm          # 进度条显示
+pytest
+tenacity

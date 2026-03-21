@@ -99,13 +99,22 @@ class TestImageAndMultimodalParsing:
 
         # 模拟替换后的结果检查
         # 实际运行中，parser.parse 会调用修改后的 _parse_with_docling
-        # 我们这里通过 mock 掉 converter.convert 来确保进入解析逻辑
+        # 鎴戜滑杩欓噷閫氳繃 mock 鎺 converter.convert 鏉ョ‘淇濊繘鍏ヨВ鏋愰€昏緫
         class MockResult:
             def __init__(self):
                 self.document = self
-                self.pictures = [type('Pic', (), {'id': 1, 'get_image': lambda self, doc: type('Img', (), {'save': lambda self, p: None})()})()]
+                # 修复 Mock: save 方法增加 **kwargs 接收 format="PNG"
+                self.pictures = [
+                    type('Pic', (), {
+                        'id': 1, 
+                        'get_image': lambda self, doc: type('Img', (), {
+                            'save': lambda self, p, **kwargs: None
+                        })()
+                    })()
+                ]
             def export_to_markdown(self, **kwargs):
                 return raw_md
+
 
         monkeypatch.setattr("docling.document_converter.DocumentConverter.convert", lambda self, p: MockResult())
         

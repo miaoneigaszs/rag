@@ -14,7 +14,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import httpx
-from tenacity import retry, reraise, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .config import RerankerConfig
 
