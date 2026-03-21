@@ -71,7 +71,7 @@ class TestSupportedExtensions:
 
 class TestImageAndMultimodalParsing:
     def test_docling_image_extraction_logic(self, parser, tmp_path, monkeypatch):
-        """测试 Docling 图片提取和多模态描述替换的逻辑流程。"""
+        """测试 Docling 图片提取和多模态描述替换的顺序替换逻辑。"""
         import rag.parser as parser_module
         from pathlib import Path
 
@@ -83,30 +83,30 @@ class TestImageAndMultimodalParsing:
             return "Mocked image description"
         monkeypatch.setattr(DocumentParser, "_get_image_caption", mock_caption)
 
-        # 3. Mock _parse_with_docling 的核心行为 (因为在测试环境下很难构造真实的 Docling 对象)
-        # 我们直接测试 _parse_with_docling 内部调用的替换逻辑
+        # 3. Mock 转换行为
         f = tmp_path / "test_with_images.pdf"
         f.write_bytes(b"%PDF-fake")
         
-        # 模拟 Docling 返回的带占位符的内容
-        raw_md = "Text before. <!-- image: 1 --> Text after."
+        # 模拟 Docling 返回的带两个固定占位符的内容
+        raw_md = "Img1: <!-- image --> | Img2: <!-- image -->"
         
-        # 我们手动触发包含图片处理逻辑的模拟调用
-        # (这里为了演示，我们模拟一个 pic_obj 并在 tmp_path 下生成图片目录)
         img_dir = tmp_path / "test_with_images_images"
         img_dir.mkdir()
-        (img_dir / "image_1.png").write_bytes(b"fake_image_data")
 
-        # 模拟替换后的结果检查
-        # 实际运行中，parser.parse 会调用修改后的 _parse_with_docling
-        # 鎴戜滑杩欓噷閫氳繃 mock 鎺 converter.convert 鏉ョ‘淇濊繘鍏ヨВ鏋愰€昏緫
+        # 模拟包含两张图片的 result 对象
         class MockResult:
             def __init__(self):
                 self.document = self
-                # 修复 Mock: save 方法增加 **kwargs 接收 format="PNG"
+                # 修复 Mock: 使用 self_ref 且 save 方法增加 **kwargs
                 self.pictures = [
                     type('Pic', (), {
-                        'id': 1, 
+                        'self_ref': '#/picture/0', 
+                        'get_image': lambda self, doc: type('Img', (), {
+                            'save': lambda self, p, **kwargs: None
+                        })()
+                    })(),
+                    type('Pic', (), {
+                        'self_ref': '#/picture/1', 
                         'get_image': lambda self, doc: type('Img', (), {
                             'save': lambda self, p, **kwargs: None
                         })()
@@ -118,15 +118,16 @@ class TestImageAndMultimodalParsing:
 
         monkeypatch.setattr("docling.document_converter.DocumentConverter.convert", lambda self, p: MockResult())
         
-        # 执行解析 (注意：这会触发我们修改后的代码)
-        # 由于我们 Mock 了 convert，代码会尝试运行图片处理循环
+        # 4. 执行解析
         text, file_type = parser.parse(str(f))
         
         assert file_type == "docling"
-        # 验证描述是否被插入
-        assert "Mocked image description" in text
-        # 验证本地路径标记是否存在
-        assert "图片本地路径" in text
+        # 验证两个占位符是否都被按顺序替换了
+        assert text.count("Mocked image description") == 2
+        assert "image_0.png" in text
+        assert "image_1.png" in text
+        # 验证原始占位符已消失
+        assert "<!-- image -->" not in text
 
     def test_image_dir_creation(self, parser, tmp_path):
         """验证是否为包含图片的文档正确创建了图片子目录。"""
@@ -137,3 +138,42 @@ class TestImageAndMultimodalParsing:
         
         # 检查逻辑是否能正确识别路径
         assert str(expected_img_dir) == str(Path(doc_path).parent / f"{Path(doc_path).stem}_images")
+
+
+class TestDoclingFallback:
+    def test_fallback_to_unstructured_when_docling_fails(self, parser, tmp_path, monkeypatch):
+        """当 Docling 解析失败时，应自动降级到 Unstructured。"""
+        import rag.parser as parser_module
+
+        # Mock Docling 可用但解析失败
+        monkeypatch.setattr(parser_module, "_HAS_DOCLING", True)
+        monkeypatch.setattr(parser_module, "_HAS_UNSTRUCTURED", True)
+
+        def _fail_docling(self, _path):
+            return None
+
+        def _succeed_unstructured(self, _path):
+            return "Unstructured fallback content"
+
+        monkeypatch.setattr(DocumentParser, "_parse_with_docling", _fail_docling)
+        monkeypatch.setattr(DocumentParser, "_parse_with_unstructured", _succeed_unstructured)
+
+        f = tmp_path / "test.pdf"
+        f.write_bytes(b"%PDF-fake")
+        text, file_type = parser.parse(str(f))
+        assert file_type == "unstructured"
+        assert "fallback" in text
+
+    def test_raises_when_all_parsers_fail(self, parser, tmp_path, monkeypatch):
+        """当所有解析器均失败时，应抛出 RuntimeError。"""
+        import rag.parser as parser_module
+
+        monkeypatch.setattr(parser_module, "_HAS_DOCLING", True)
+        monkeypatch.setattr(parser_module, "_HAS_UNSTRUCTURED", True)
+        monkeypatch.setattr(DocumentParser, "_parse_with_docling", lambda s, p: None)
+        monkeypatch.setattr(DocumentParser, "_parse_with_unstructured", lambda s, p: None)
+
+        f = tmp_path / "broken.pdf"
+        f.write_bytes(b"broken")
+        with pytest.raises(RuntimeError, match="所有解析器"):
+            parser.parse(str(f))
