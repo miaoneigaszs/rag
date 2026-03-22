@@ -50,24 +50,7 @@ class HierarchicalMarkdownSplitter:
             if not content:
                 continue
 
-            # ── 短节：合并到前一个 chunk，而不是丢弃 ──────────────────────
-            if len(content) < self.cfg.min_chunk_size:
-                if chunks:
-                    chunks[-1]["content"] += "\n\n" + content
-                    chunks[-1]["char_count"] = len(chunks[-1]["content"])
-                else:
-                    # 没有前一个 chunk，宁可保留短内容也不丢弃
-                    chunks.append(
-                        {
-                            "content": content,
-                            "heading_path": section["heading_path"],
-                            "section_index": section_index,
-                            "char_count": len(content),
-                        }
-                    )
-                continue
-
-            # ── 正常节：直接入块或递归分割 ────────────────────────────────
+            # ── 完整语义节：无论长短，均不应与前一个不同的 Section 合并 ────────────────
             if len(content) <= self.cfg.chunk_size:
                 chunks.append(
                     {
@@ -78,9 +61,17 @@ class HierarchicalMarkdownSplitter:
                     }
                 )
             else:
+                # ── 超长节递归分割：只合并不满 min_chunk_size 的内部碎片 ───────────────
                 for sub in self._recursive_split(content, self.SEPARATORS):
                     sub = sub.strip()
-                    if len(sub) >= self.cfg.min_chunk_size:
+                    if not sub:
+                        continue
+                    
+                    # 如果该子块太小，且前面的 chunk 属于同一个 section，则安全合入前一个 chunk
+                    if len(sub) < self.cfg.min_chunk_size and chunks and chunks[-1]["section_index"] == section_index:
+                        chunks[-1]["content"] += "\n" + sub
+                        chunks[-1]["char_count"] = len(chunks[-1]["content"])
+                    else:
                         chunks.append(
                             {
                                 "content": sub,
