@@ -36,24 +36,44 @@ class HierarchicalMarkdownSplitter:
 
         Returns:
             List[dict]，每个 dict 包含：
-              content      : str
-              heading_path : List[str]
-              chunk_index  : int
-              char_count   : int
+              content       : str
+              heading_path  : List[str]
+              chunk_index   : int        全局线性序号
+              section_index : int        所属语义节序号（用于溯源）
+              char_count    : int
         """
         raw_sections = self._split_by_headings(text)
         chunks: List[Dict[str, Any]] = []
 
-        for section in raw_sections:
+        for section_index, section in enumerate(raw_sections):
             content = section["content"].strip()
-            if len(content) < self.cfg.min_chunk_size:
+            if not content:
                 continue
 
+            # ── 短节：合并到前一个 chunk，而不是丢弃 ──────────────────────
+            if len(content) < self.cfg.min_chunk_size:
+                if chunks:
+                    chunks[-1]["content"] += "\n\n" + content
+                    chunks[-1]["char_count"] = len(chunks[-1]["content"])
+                else:
+                    # 没有前一个 chunk，宁可保留短内容也不丢弃
+                    chunks.append(
+                        {
+                            "content": content,
+                            "heading_path": section["heading_path"],
+                            "section_index": section_index,
+                            "char_count": len(content),
+                        }
+                    )
+                continue
+
+            # ── 正常节：直接入块或递归分割 ────────────────────────────────
             if len(content) <= self.cfg.chunk_size:
                 chunks.append(
                     {
                         "content": content,
                         "heading_path": section["heading_path"],
+                        "section_index": section_index,
                         "char_count": len(content),
                     }
                 )
@@ -65,6 +85,7 @@ class HierarchicalMarkdownSplitter:
                             {
                                 "content": sub,
                                 "heading_path": section["heading_path"],
+                                "section_index": section_index,
                                 "char_count": len(sub),
                             }
                         )
@@ -105,7 +126,7 @@ class HierarchicalMarkdownSplitter:
                 heading_stack[level - 1] = title
                 for i in range(level, 6):
                     heading_stack[i] = ""
-                current_lines.append(line)  # 标题本身作为内容首行
+                # 修复：标题已存入 heading_path，内容里不再重复添加标题行
             else:
                 current_lines.append(line)
 
@@ -139,15 +160,15 @@ class HierarchicalMarkdownSplitter:
                 chunk_str = sep.join(current)
                 if chunk_str.strip():
                     chunks.append(chunk_str)
-                # 保留重叠尾部
+                # 保留重叠尾部：用 continue 而非 break，尽量填满 overlap 窗口
                 kept: List[str] = []
                 overlap_acc = 0
                 for p in reversed(current):
-                    if overlap_acc + len(p) <= self.cfg.chunk_overlap:
+                    if overlap_acc + len(p) + len(sep) <= self.cfg.chunk_overlap:
                         kept.insert(0, p)
                         overlap_acc += len(p) + len(sep)
                     else:
-                        break
+                        break  # 保证重叠内容是原文末尾的连续片段
                 current = kept
                 current_len = overlap_acc
 

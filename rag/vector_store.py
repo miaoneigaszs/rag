@@ -109,29 +109,22 @@ class SparseEncoder:
         if not tokens:
             return [], []
 
-        # 词频统计
         tf: Dict[str, int] = {}
         for t in tokens:
             tf[t] = tf.get(t, 0) + 1
 
         max_freq = max(tf.values())
-        indices: List[int] = []
-        values: List[float] = []
-
         seen_ids: Dict[int, float] = {}
         for token, freq in tf.items():
             tid = self._token_id(token)
-            weight = freq / max_freq  # 归一化 TF
-            # 碰撞时取最大权重
+            weight = freq / max_freq
             if tid in seen_ids:
                 seen_ids[tid] = max(seen_ids[tid], weight)
             else:
                 seen_ids[tid] = weight
 
-        for tid, weight in seen_ids.items():
-            indices.append(tid)
-            values.append(weight)
-
+        indices = list(seen_ids.keys())
+        values = list(seen_ids.values())
         return indices, values
 
 
@@ -213,12 +206,17 @@ class QdrantVectorStore:
             optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
         )
 
-        # 为常用过滤字段创建 payload 索引
-        for field_name in ("source_file", "doc_id", "heading_str"):
+        # payload 索引：常用过滤字段 + section 扩展检索所需字段
+        for field_name, schema in [
+            ("source_file", PayloadSchemaType.KEYWORD),
+            ("doc_id", PayloadSchemaType.KEYWORD),
+            ("heading_str", PayloadSchemaType.KEYWORD),
+            ("section_index", PayloadSchemaType.INTEGER),   # 高级 RAG section 扩展检索
+        ]:
             self._client.create_payload_index(
                 collection_name=self.collection,
                 field_name=field_name,
-                field_schema=PayloadSchemaType.KEYWORD,
+                field_schema=schema,
             )
 
         logger.info(
@@ -310,6 +308,44 @@ class QdrantVectorStore:
             with_payload=True,
         )
         return [{"id": str(r.id), "score": r.score, "payload": r.payload} for r in results]
+
+    def fetch_by_section(
+        self,
+        source_file: str,
+        section_index: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        高级 RAG：按 source_file + section_index 拉取该 section 的所有 chunk，
+        按 chunk_index 升序排列，用于检索后扩展上下文。
+
+        Args:
+            source_file   : 文件名（payload 中的 source_file 字段）
+            section_index : 语义节序号（payload 中的 section_index 字段）
+
+        Returns:
+            按 chunk_index 升序排列的 chunk payload 列表
+        """
+        if section_index == -1:
+            return []
+
+        results, _ = self._client.scroll(
+            collection_name=self.collection,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="source_file", match=MatchValue(value=source_file)),
+                    FieldCondition(key="section_index", match=MatchValue(value=section_index)),
+                ]
+            ),
+            limit=200,          # 单 section 不应超过 200 个 chunk
+            with_payload=True,
+            with_vectors=False,
+        )
+        # 按 chunk_index 升序排列，保证文本顺序
+        sorted_results = sorted(
+            results,
+            key=lambda r: r.payload.get("chunk_index", 0) if r.payload else 0,
+        )
+        return [{"id": str(r.id), "payload": r.payload} for r in sorted_results]
 
     # ------------------------------------------------------------------
     # 异步检索

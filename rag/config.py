@@ -12,7 +12,6 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-    # 自动搜索当前目录或父目录中的 .env 文件并加载
     load_dotenv()
 except ImportError:
     pass
@@ -26,12 +25,10 @@ except ImportError:
 class EmbeddingConfig:
     """Embedding 接口配置（兼容 OpenAI API 规范的任意服务）"""
 
-    # 官方 OpenAI
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "text-embedding-3-small"
 
-    # 中转站（SiliconFlow / OneAPI / 智谱 等）
     proxy_api_key: str = field(default_factory=lambda: os.getenv("PROXY_API_KEY", ""))
     proxy_base_url: str = field(
         default_factory=lambda: os.getenv("PROXY_BASE_URL", "https://api.siliconflow.cn/v1")
@@ -40,13 +37,8 @@ class EmbeddingConfig:
         default_factory=lambda: os.getenv("PROXY_EMBED_MODEL", "BAAI/bge-large-zh-v1.5")
     )
 
-    # 运行时选择："openai" 或 "proxy"
     provider: str = field(default_factory=lambda: os.getenv("EMBED_PROVIDER", "proxy"))
-
-    # 向量维度
     dimension: int = field(default_factory=lambda: int(os.getenv("EMBED_DIM", "1024")))
-
-    # 批次大小
     batch_size: int = 32
 
     def __post_init__(self) -> None:
@@ -126,7 +118,13 @@ class ChunkConfig:
     chunk_overlap: int = 150
     min_chunk_size: int = 50
 
+    # ── RAG 模式 ────────────────────────────────────────────────────────────
+    # "basic"    : 普通 RAG，检索返回命中 chunk 本身
+    # "advanced" : 高级 RAG，检索后自动扩展同 section 的所有 chunk 作为上下文
+    rag_mode: str = field(default_factory=lambda: os.getenv("RAG_MODE", "basic"))
+
     # Contextual Retrieval（Anthropic 2024）
+    # use_contextual_retrieval=True 时，入库前为每个 chunk 生成 section 级上下文摘要
     use_contextual_retrieval: bool = True
     context_model: str = field(default_factory=lambda: os.getenv("CONTEXT_MODEL", ""))
     context_max_tokens: int = 100
@@ -137,7 +135,6 @@ class ChunkConfig:
         default_factory=lambda: int(os.getenv("CONTEXTUAL_CACHE_SIZE", "2048"))
     )
 
-    # 缓存后端："memory" / "disk" / "redis"
     contextual_cache_backend: str = field(
         default_factory=lambda: os.getenv("CONTEXTUAL_CACHE_BACKEND", "disk")
     )
@@ -160,6 +157,10 @@ class ChunkConfig:
             raise ValueError(f"ChunkConfig.chunk_overlap 不能为负数，当前值: {self.chunk_overlap}")
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("ChunkConfig.chunk_overlap 必须小于 chunk_size")
+        if self.rag_mode not in ("basic", "advanced"):
+            raise ValueError(
+                f"ChunkConfig.rag_mode 必须为 'basic' 或 'advanced'，当前值: {self.rag_mode!r}"
+            )
         if self.contextual_cache_backend not in ("memory", "disk", "redis"):
             raise ValueError(
                 f"ChunkConfig.contextual_cache_backend 必须为 'memory'/'disk'/'redis'，"
@@ -180,7 +181,6 @@ class RAGConfig:
     qdrant: QdrantConfig = field(default_factory=QdrantConfig)
     chunk: ChunkConfig = field(default_factory=ChunkConfig)
 
-    # 检索参数
-    fetch_k_multiplier: int = 5   # 海选倍率：top_k * fetch_k_multiplier 进入 rerank
-    rrf_k: int = 60               # RRF 平滑常数
-    score_threshold: float = 0.0  # 最低相似度阈值（0 = 不过滤）
+    fetch_k_multiplier: int = 5
+    rrf_k: int = 60
+    score_threshold: float = 0.0

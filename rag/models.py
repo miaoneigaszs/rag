@@ -15,14 +15,15 @@ from typing import Any, Dict, List
 class DocumentChunk:
     """单个文档切块，贯穿解析 → 存储 → 检索全流程。"""
 
-    chunk_id: str                        # UUID
-    doc_id: str                          # 文档级 SHA-256（同文件共享）
-    content: str                         # 原始 chunk 文本
-    context_prefix: str = ""            # Contextual Retrieval 生成的上下文摘要
+    chunk_id: str
+    doc_id: str
+    content: str
+    context_prefix: str = ""
     source_file: str = ""
     file_type: str = ""
-    heading_path: List[str] = field(default_factory=list)  # ["H1文本", "H2文本", ...]
+    heading_path: List[str] = field(default_factory=list)
     chunk_index: int = 0
+    section_index: int = -1          # 所属语义节序号，-1 表示未知；用于高级 RAG section 扩展
     char_count: int = 0
     upload_time: str = ""
     extra_meta: Dict[str, Any] = field(default_factory=dict)
@@ -40,6 +41,7 @@ class DocumentChunk:
         file_type: str = "",
         heading_path: List[str] | None = None,
         chunk_index: int = 0,
+        section_index: int = -1,
         upload_time: str = "",
         extra_meta: Dict[str, Any] | None = None,
     ) -> "DocumentChunk":
@@ -52,6 +54,7 @@ class DocumentChunk:
             file_type=file_type,
             heading_path=heading_path or [],
             chunk_index=chunk_index,
+            section_index=section_index,
             char_count=len(content),
             upload_time=upload_time,
             extra_meta=extra_meta or {},
@@ -63,10 +66,14 @@ class DocumentChunk:
 
     @property
     def full_text_for_embed(self) -> str:
-        """用于生成向量的文本：上下文前缀 + 内容（若有前缀）。"""
+        """用于生成向量的文本：标题路径 + 上下文前缀 + 内容。"""
+        parts = []
+        if self.heading_path:
+            parts.append(self.heading_str)
         if self.context_prefix:
-            return f"{self.context_prefix}\n\n{self.content}"
-        return self.content
+            parts.append(self.context_prefix)
+        parts.append(self.content)
+        return "\n\n".join(parts)
 
     @property
     def heading_str(self) -> str:
@@ -89,6 +96,7 @@ class DocumentChunk:
             "heading_path": self.heading_path,
             "heading_str": self.heading_str,
             "chunk_index": self.chunk_index,
+            "section_index": self.section_index,   # 高级 RAG section 扩展检索依赖此字段
             "char_count": self.char_count,
             "upload_time": self.upload_time,
             **self.extra_meta,

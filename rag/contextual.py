@@ -3,8 +3,8 @@ rag/contextual.py
 =================
 Contextual Retrieval（Anthropic 2024 论文）实现。
 
-为每个 chunk 在存储前追加一段 LLM 生成的上下文摘要，
-解决 chunk 脱离文档上下文后语义漂移的问题。
+改进版：使用 section 级上下文（同 section 所有 chunk 拼合）替代单 chunk + 标题路径，
+解决原版"局部视野"问题，同时避免全文传入的高成本。
 
 缓存后端（ContextualCacheBackend 抽象层）：
   MemoryCacheBackend  → 内存 dict，进程内，调试用
@@ -18,10 +18,11 @@ import abc
 import hashlib
 import logging
 import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
-from openai import AsyncOpenAI, OpenAI
+from openai import OpenAI
 from tqdm import tqdm
 
 from .config import ChunkConfig, RAGConfig
@@ -81,7 +82,6 @@ class MemoryCacheBackend(ContextualCacheBackend):
     def set(self, key: str, value: str) -> None:
         with self._lock:
             if len(self._cache) >= self._max_size:
-                # 简单 LRU：淘汰最旧的 10%
                 evict = max(1, self._max_size // 10)
                 for k in list(self._cache.keys())[:evict]:
                     del self._cache[k]
@@ -89,12 +89,7 @@ class MemoryCacheBackend(ContextualCacheBackend):
 
 
 class DiskCacheBackend(ContextualCacheBackend):
-    """
-    diskcache SQLite 文件后端。
-
-    优点：跨重启持久化、零额外服务、线程安全、自动 LRU 淘汰。
-    适用：单机部署 / 单进程 / 开发测试环境。
-    """
+    """diskcache SQLite 文件后端，跨重启持久化，单机首选。"""
 
     def __init__(self, cache_dir: str, size_limit_mb: int = 512) -> None:
         if not _HAS_DISKCACHE:
@@ -117,12 +112,7 @@ class DiskCacheBackend(ContextualCacheBackend):
 
 
 class RedisCacheBackend(ContextualCacheBackend):
-    """
-    Redis 后端。
-
-    优点：多 Worker / 多实例共享、TTL 支持。
-    适用：生产多实例部署。
-    """
+    """Redis 后端，多 Worker / 多实例共享，TTL 支持，生产高可用。"""
 
     _KEY_PREFIX = "ctx_retrieval:"
 
@@ -158,7 +148,6 @@ def build_cache_backend(cfg: ChunkConfig) -> ContextualCacheBackend:
         )
     if backend == "disk":
         return DiskCacheBackend(cache_dir=cfg.contextual_cache_dir)
-    # "memory" 或未知值（config 层已校验，此处是最后防线）
     return MemoryCacheBackend(max_size=cfg.contextual_cache_size)
 
 
@@ -168,19 +157,37 @@ def build_cache_backend(cfg: ChunkConfig) -> ContextualCacheBackend:
 
 class ContextualRetrieval:
     """
-    Anthropic 2024 论文：Contextual Retrieval。
+    改进版 Contextual Retrieval：section 级上下文生成。
 
-    为每个 chunk 在存储前追加一段 LLM 生成的上下文摘要，
-    缓存命中时不重复调用 LLM（disk/redis 后端跨重启有效）。
+    原版问题：只把 heading_path + 单个 chunk 传给 LLM，LLM 没有全局视野，
+    生成的 context_prefix 与直接用 heading_str 差别不大。
+
+    改进策略：
+      1. 按 section_index 将同一文档的 chunk 分组
+      2. 把同 section 内所有 chunk 拼合成"局部文档"（通常 500~3000 字）
+      3. LLM 以"局部文档 + 当前 chunk"为输入生成上下文摘要
+      → LLM 获得了 section 级全局视野，成本远低于全文方案
+
+    缓存键 = hash(section_text + chunk_content)，section 内容变化时自动失效。
     """
 
+    # 输入：section 全文 + 当前 chunk，要求生成一句上下文描述
     _PROMPT_TEMPLATE = (
-        "以下是一份完整文档的节选内容（chunk），请用1-2句话简要描述该 chunk\n"
-        "在整篇文档中的位置和作用，以帮助检索时快速定位。只输出描述，不要解释。\n\n"
-        "文档标题路径：{heading_str}\n\n"
-        "Chunk 内容：\n{chunk_content}\n\n"
+        "以下是一个文档章节的完整内容（section）：\n"
+        "---\n"
+        "{section_text}\n"
+        "---\n\n"
+        "现在请看该章节中的一个片段（chunk）：\n"
+        "---\n"
+        "{chunk_content}\n"
+        "---\n\n"
+        "请结合章节全文，用1-2句话描述这个片段在章节中的位置和作用，"
+        "使其在被单独检索时依然语义清晰。只输出描述，不要解释或重复原文。\n"
         "请用中文回答（若文档为英文则用英文）："
     )
+
+    # section 文本截断上限（约 3000 字），防止单 section 过长导致费用失控
+    _SECTION_TEXT_LIMIT = 3000
 
     def __init__(self, cfg: RAGConfig) -> None:
         embed_cfg = cfg.embedding
@@ -202,7 +209,7 @@ class ContextualRetrieval:
         self._cache = build_cache_backend(chunk_cfg)
 
         logger.info(
-            f"[ContextualRetrieval] 已启用，模型={self._model}, "
+            f"[ContextualRetrieval] 已启用（section 级上下文），模型={self._model}, "
             f"max_concurrency={self._max_concurrency}, "
             f"cache_backend={chunk_cfg.contextual_cache_backend}"
         )
@@ -212,24 +219,30 @@ class ContextualRetrieval:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _cache_key(content: str, heading_str: str = "") -> str:
-        """结合标题和内容前缀的 SHA-256 作为缓存键，降低不同段落间相似前缀的碰撞风险。"""
-        raw = f"{heading_str}::{content[:500]}"
+    def _cache_key(section_text: str, chunk_content: str) -> str:
+        """缓存键 = hash(section_text前200字 + chunk_content前500字)。"""
+        raw = f"{section_text[:200]}::{chunk_content[:500]}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     # ------------------------------------------------------------------
     # 单条生成
     # ------------------------------------------------------------------
 
-    def generate_context(self, chunk_content: str, heading_str: str) -> str:
-        """为单个 chunk 生成上下文摘要（同步，带持久化缓存）。"""
-        key = self._cache_key(chunk_content, heading_str)
+    def generate_context(self, section_text: str, chunk_content: str) -> str:
+        """
+        为单个 chunk 生成上下文摘要（同步，带持久化缓存）。
+
+        Args:
+            section_text  : 当前 chunk 所在 section 的完整文本（已截断）
+            chunk_content : 当前 chunk 的原始内容
+        """
+        key = self._cache_key(section_text, chunk_content)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
 
         prompt = self._PROMPT_TEMPLATE.format(
-            heading_str=heading_str or "（无标题）",
+            section_text=section_text[:self._SECTION_TEXT_LIMIT],
             chunk_content=chunk_content[:500],
         )
         try:
@@ -247,7 +260,7 @@ class ContextualRetrieval:
             return ""
 
     # ------------------------------------------------------------------
-    # 批量并发生成
+    # 批量并发生成（section 级）
     # ------------------------------------------------------------------
 
     def enrich_chunks(
@@ -256,20 +269,45 @@ class ContextualRetrieval:
         max_workers: Optional[int] = None,
     ) -> List["DocumentChunk"]:
         """
-        并发为所有 chunk 生成上下文前缀。
+        按 section_index 分组，为每个 chunk 生成 section 级上下文前缀。
 
-        使用 ThreadPoolExecutor + Semaphore 双层限速：
-          - ThreadPoolExecutor.max_workers 控制线程总数
-          - Semaphore 控制同时飞行的 HTTP 请求数
+        流程：
+          1. 按 section_index 聚合，拼合同 section 所有 chunk 为 section_text
+          2. 批量预检缓存命中，统计需要调用 LLM 的数量
+          3. ThreadPoolExecutor + Semaphore 并发生成，保持原始顺序写回
 
-        缓存命中统计使用批量预检（一次性收集 key → 批量查询），
-        避免对 Redis 等后端产生 N 次独立网络请求。
+        section_index == -1 的 chunk（合并短节产生）降级为只用 heading_str。
         """
         workers = max_workers or self._max_concurrency
         sem = threading.Semaphore(self._max_concurrency)
 
-        # 批量预检缓存命中（减少 N+1 问题：一次遍历构建 key 列表，逐一查询但在本地完成）
-        keys = [self._cache_key(c.content, c.heading_str) for c in chunks]
+        # ── 1. 按 section_index 聚合 section 文本 ─────────────────────────
+        # section_text_map: section_index → 该 section 所有 chunk 内容拼合
+        section_text_map: Dict[int, str] = defaultdict(str)
+        for chunk in chunks:
+            idx = chunk.section_index
+            if idx != -1:
+                # 按 chunk_index 顺序拼合，用双换行分隔（heading_str作为section标题首行）
+                section_text_map[idx]  # 预占 key，保证 defaultdict 有序填充
+
+        # 先按 chunk_index 排序，保证拼合顺序正确
+        sorted_chunks = sorted(chunks, key=lambda c: (c.section_index, c.chunk_index))
+        for chunk in sorted_chunks:
+            idx = chunk.section_index
+            if idx != -1:
+                prefix = f"【{chunk.heading_str}】\n" if chunk.heading_str and not section_text_map[idx] else ""
+                section_text_map[idx] += prefix + chunk.content + "\n\n"
+
+        # ── 2. 为每个 chunk 确定其 section_text ──────────────────────────
+        def _get_section_text(chunk: "DocumentChunk") -> str:
+            if chunk.section_index == -1:
+                # 降级：没有 section 信息，用 heading_str 作为最小上下文
+                return chunk.heading_str or ""
+            return section_text_map.get(chunk.section_index, "")
+
+        # ── 3. 批量预检缓存 ────────────────────────────────────────────────
+        section_texts = [_get_section_text(c) for c in chunks]
+        keys = [self._cache_key(st, c.content) for st, c in zip(section_texts, chunks)]
         cached_flags = [self._cache.get(k) is not None for k in keys]
         cache_hits = sum(cached_flags)
 
@@ -278,13 +316,19 @@ class ContextualRetrieval:
             f"（缓存命中 {cache_hits}，需调用 LLM {len(chunks) - cache_hits}，并发={workers}）"
         )
 
-        def _guarded_generate(chunk: "DocumentChunk") -> str:
+        # ── 4. 并发生成 ────────────────────────────────────────────────────
+        def _guarded_generate(chunk: "DocumentChunk", section_text: str) -> str:
             with sem:
-                return self.generate_context(chunk.content, chunk.heading_str)
+                return self.generate_context(section_text, chunk.content)
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_guarded_generate, c): i for i, c in enumerate(chunks)}
-            for future in tqdm(as_completed(futures), total=len(futures), desc="ContextualRetrieval"):
+            futures = {
+                executor.submit(_guarded_generate, c, st): i
+                for i, (c, st) in enumerate(zip(chunks, section_texts))
+            }
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="ContextualRetrieval"
+            ):
                 idx = futures[future]
                 try:
                     chunks[idx].context_prefix = future.result()
