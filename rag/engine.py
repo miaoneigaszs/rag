@@ -8,14 +8,18 @@ RAG 主引擎。
 
 检索流程（同步）：
   Query → Embed → Dense(Qdrant) ──┐
-               → Sparse(Qdrant) ──┴→ RRF → [Reranker] → TopK
+               → Sparse(Qdrant) ──┴→ RRF → [Reranker] → TopK → [Section扩展]
 
 检索流程（异步）：
   Query → Embed(async) → Dense(AsyncQdrant) ──┐  ← asyncio.gather
-                       → Sparse(AsyncQdrant) ──┴→ RRF → Reranker(async)
+                       → Sparse(AsyncQdrant) ──┴→ RRF → Reranker(async) → [Section扩展]
 
-生命周期管理（FIX-2）：
-  不在 __init__ 里启动任何后台线程。
+RAG 模式（通过 ChunkConfig.rag_mode 配置）：
+  "basic"    : 普通 RAG，返回命中 chunk 本身
+  "advanced" : 高级 RAG，检索后按 section_index 拉取同 section 所有 chunk，
+               拼合为完整 section 文本作为 LLM 上下文（Parent Document Retrieval）
+
+生命周期管理：
   框架集成：
     FastAPI  → @asynccontextmanager lifespan：await engine.startup() / await engine.shutdown()
     脚本     → engine.startup_sync() / asyncio.run(engine.shutdown())
@@ -52,31 +56,27 @@ class RAGEngine:
     工业级 RAG 主引擎。
 
     使用示例（脚本）：
-        engine = create_rag_engine(embed_api_key="...", reranker_api_key="...")
+        engine = create_rag_engine(
+            embed_api_key="...",
+            reranker_api_key="...",
+            rag_mode="advanced",        # 开启高级 RAG
+        )
         engine.startup_sync()
-        result = engine.index_file("doc.pdf")
+        engine.index_file("doc.pdf")
         hits = engine.retrieve("如何配置环境变量？")
         asyncio.run(engine.shutdown())
 
     使用示例（FastAPI）：
-        from contextlib import asynccontextmanager
-        from fastapi import FastAPI
-
-        engine = create_rag_engine(...)
-
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             await engine.startup()
             yield
             await engine.shutdown()
-
-        app = FastAPI(lifespan=lifespan)
     """
 
     def __init__(self, cfg: Optional[RAGConfig] = None) -> None:
         self.cfg = cfg or RAGConfig()
 
-        # 构建各子组件（不触发任何 IO / 后台线程）
         self.parser = DocumentParser()
         self.splitter = HierarchicalMarkdownSplitter(self.cfg.chunk)
         self.embedder = EmbeddingService(self.cfg.embedding)
@@ -94,36 +94,23 @@ class RAGEngine:
     # =========================================================================
 
     async def startup(self) -> None:
-        """
-        显式启动方法，由外层框架的 lifespan 调用（FastAPI / 其他异步框架）。
-
-        Qdrant Sparse Vector 方案下，启动仅需验证连接，
-        无需像 BM25 那样 scroll 全量数据重建内存索引，启动更快。
-        """
         if self._started:
             logger.warning("[RAGEngine] startup() 已被调用过，跳过重复初始化")
             return
         logger.info("[RAGEngine] 启动中...")
-        # 验证 Qdrant 连接
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.vector_store.collection_info)
         self._started = True
         logger.info("[RAGEngine] 启动完成")
 
     def startup_sync(self) -> None:
-        """同步版启动方法，供脚本 / 非 async 场景使用。"""
         if self._started:
             return
-        self.vector_store.collection_info()  # 验证连接
+        self.vector_store.collection_info()
         self._started = True
         logger.info("[RAGEngine] 同步启动完成")
 
     async def shutdown(self) -> None:
-        """
-        显式关闭方法，由外层框架的 lifespan 在 yield 后调用。
-
-        关闭顺序：Contextual 缓存 → Reranker 连接池。
-        """
         logger.info("[RAGEngine] 开始关闭...")
 
         if self.contextual:
@@ -134,7 +121,6 @@ class RAGEngine:
                 logger.warning(f"[RAGEngine] 关闭 Contextual 缓存失败: {exc}")
 
         if self.reranker:
-            # 修复：通过 reranker.close() 封装接口，不直接访问私有属性
             await self.reranker.close()
             logger.info("[RAGEngine] Reranker HTTP 连接池已关闭")
 
@@ -154,11 +140,6 @@ class RAGEngine:
         """
         索引单个文件。
 
-        Args:
-            file_path    : 文件路径
-            extra_meta   : 额外元数据（如 category、author、tags 等）
-            force_reindex: 即使文件已存在也强制重新索引
-
         Returns:
             {"status": "ok"|"skipped"|"error", "chunks": int, "doc_id": str, ...}
         """
@@ -166,7 +147,6 @@ class RAGEngine:
         source_file = Path(file_path).name
         upload_time = datetime.now(timezone.utc).isoformat()
 
-        # ── 1. 去重检查 ──────────────────────────────────────────────────────
         doc_id = self._compute_doc_hash(file_path)
         if not force_reindex and self.vector_store.doc_exists(doc_id):
             logger.info(f"[Index] 文件已存在，跳过: {source_file} (doc_id={doc_id[:8]}...)")
@@ -174,7 +154,6 @@ class RAGEngine:
 
         logger.info(f"[Index] 开始处理: {source_file}")
 
-        # ── 2. 文档解析 ──────────────────────────────────────────────────────
         try:
             md_text, file_type = self.parser.parse(file_path)
         except Exception as exc:
@@ -185,12 +164,10 @@ class RAGEngine:
             logger.warning(f"[Index] 解析结果为空: {source_file}")
             return {"status": "error", "error": "文档内容为空", "source_file": source_file}
 
-        # ── 3. 切块 ──────────────────────────────────────────────────────────
         raw_chunks = self.splitter.split(md_text, source_file=source_file)
         if not raw_chunks:
             return {"status": "error", "error": "切块结果为空", "source_file": source_file}
 
-        # ── 4. 构建 DocumentChunk 对象 ────────────────────────────────────────
         chunks: List[DocumentChunk] = [
             DocumentChunk.create(
                 doc_id=doc_id,
@@ -199,17 +176,16 @@ class RAGEngine:
                 file_type=file_type,
                 heading_path=raw["heading_path"],
                 chunk_index=raw["chunk_index"],
+                section_index=raw.get("section_index", -1),
                 upload_time=upload_time,
                 extra_meta=extra_meta or {},
             )
             for raw in raw_chunks
         ]
 
-        # ── 5. Contextual Retrieval（可选）────────────────────────────────────
         if self.contextual:
             chunks = self.contextual.enrich_chunks(chunks)
 
-        # ── 6. Embedding ──────────────────────────────────────────────────────
         texts_for_embed = [c.full_text_for_embed for c in chunks]
         try:
             dense_vectors = self.embedder.embed_all(texts_for_embed)
@@ -217,7 +193,6 @@ class RAGEngine:
             logger.error(f"[Index] Embedding 失败: {exc}")
             return {"status": "error", "error": f"Embedding 失败: {exc}", "source_file": source_file}
 
-        # ── 7. 写入 Qdrant（dense + sparse 同步写入）─────────────────────────
         self.vector_store.upsert(chunks, dense_vectors)
 
         result = {
@@ -253,11 +228,7 @@ class RAGEngine:
         return results
 
     def delete_file(self, source_file: str) -> None:
-        """
-        删除某文件的所有 chunk。
-
-        Qdrant Sparse Vector 方案下，删除即删除，无需像 BM25 方案那样重建内存索引。
-        """
+        """删除某文件的所有 chunk。"""
         self.vector_store.delete_by_source_file(source_file)
         logger.info(f"[Delete] 已删除: {source_file}")
 
@@ -274,14 +245,12 @@ class RAGEngine:
         score_threshold: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """
-        主检索接口（同步）：Dense + Sparse → RRF → Reranker → TopK。
+        主检索接口（同步）：Dense + Sparse → RRF → Reranker → TopK → [Section扩展]。
 
-        Args:
-            query            : 检索查询文本
-            top_k            : 最终返回条数
-            filter_conditions: Qdrant payload 过滤条件，如 {"source_file": "xxx.pdf"}
-            skip_rerank      : 跳过 reranker（快速预览）
-            score_threshold  : 向量相似度最低阈值（0 = 不过滤）
+        basic 模式   : 直接返回 top_k 个命中 chunk
+        advanced 模式: 对每个命中 chunk 拉取其所在 section 的全部 chunk，
+                       拼合为 section_context 字段追加到结果中，
+                       LLM 调用时使用 section_context 而非单个 content
         """
         fetch_k = top_k * self.cfg.fetch_k_multiplier
 
@@ -307,7 +276,13 @@ class RAGEngine:
         else:
             fused = fused[:top_k]
 
-        return self._format_results(fused)
+        results = self._format_results(fused)
+
+        # ── 高级 RAG：section 扩展 ────────────────────────────────────────
+        if self.cfg.chunk.rag_mode == "advanced":
+            results = self._expand_sections(results)
+
+        return results
 
     # =========================================================================
     # 核心检索接口（异步）
@@ -328,14 +303,7 @@ class RAGEngine:
     ) -> List[Dict[str, Any]]:
         """
         主检索接口（异步）：Dense 和 Sparse 并发，Reranker 异步。
-
-        并发策略：
-          Dense  → AsyncQdrantClient.search()（原生异步）
-          Sparse → AsyncQdrantClient.search()（原生异步）
-          Embed  → AsyncOpenAI.embeddings.create()（原生异步）
-          Rerank → httpx.AsyncClient.post()（原生异步）
-
-        三路 IO（Embed + Dense + Sparse）全程异步，无 run_in_executor 阻塞。
+        advanced 模式下 section 扩展通过线程池隔离（Qdrant scroll 为同步调用）。
         """
         fetch_k = top_k * self.cfg.fetch_k_multiplier
 
@@ -358,7 +326,6 @@ class RAGEngine:
 
         dense_results, sparse_results_raw = await asyncio.gather(_dense(), _sparse())
 
-        # 将稀疏检索结果转为 RRF 期望的格式（与 dense 同构）
         sparse_results: List[Tuple[str, float]] = [
             (r["id"], r["score"]) for r in sparse_results_raw
         ]
@@ -372,7 +339,67 @@ class RAGEngine:
         else:
             fused = fused[:top_k]
 
-        return self._format_results(fused)
+        results = self._format_results(fused)
+
+        # ── 高级 RAG：section 扩展（线程池隔离同步 scroll）────────────────
+        if self.cfg.chunk.rag_mode == "advanced":
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(None, self._expand_sections, results)
+
+        return results
+
+    # =========================================================================
+    # Section 扩展（高级 RAG 核心）
+    # =========================================================================
+
+    def _expand_sections(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        对每个检索结果，按 source_file + section_index 拉取同 section 的所有 chunk，
+        拼合为 section_context 字段追加到结果中。
+
+        去重策略：同一 (source_file, section_index) 只拉取一次，避免重复 scroll。
+
+        结果新增字段：
+          section_context : str   同 section 所有 chunk 按顺序拼合的完整文本
+                                  （LLM 调用时替代单个 content 使用）
+          section_chunk_count : int  该 section 共有多少个 chunk
+        """
+        # 缓存已拉取的 section，避免重复 scroll
+        section_cache: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+
+        for result in results:
+            source_file = result.get("source_file", "")
+            section_index = result.get("section_index", -1)
+
+            # section_index == -1 表示无 section 信息，跳过扩展
+            if section_index == -1:
+                result["section_context"] = result["content"]
+                result["section_chunk_count"] = 1
+                continue
+
+            cache_key = (source_file, section_index)
+            if cache_key not in section_cache:
+                section_chunks = self.vector_store.fetch_by_section(source_file, section_index)
+                section_cache[cache_key] = section_chunks
+
+            section_chunks = section_cache[cache_key]
+
+            if not section_chunks:
+                result["section_context"] = result["content"]
+                result["section_chunk_count"] = 1
+            else:
+                # 拼合 section 内所有 chunk，保持原始顺序
+                section_text = "\n\n".join(
+                    c["payload"].get("content", "") for c in section_chunks
+                )
+                result["section_context"] = section_text
+                result["section_chunk_count"] = len(section_chunks)
+
+        logger.debug(
+            f"[Retrieve] advanced 模式 section 扩展完成，"
+            f"涉及 {len(section_cache)} 个唯一 section"
+        )
+        return results
 
     # =========================================================================
     # RRF 融合
@@ -384,23 +411,17 @@ class RAGEngine:
         sparse_results: List[Tuple[str, float]],
         top_k: int,
     ) -> List[Dict[str, Any]]:
-        """
-        Reciprocal Rank Fusion。
-
-        score(doc) = Σ 1 / (k + rank_i)，k=rrf_k（默认 60）
-        """
+        """Reciprocal Rank Fusion。score(doc) = Σ 1 / (k + rank_i)"""
         rrf_k = self.cfg.rrf_k
         scores: Dict[str, float] = {}
         id_to_payload: Dict[str, Dict[str, Any]] = {}
 
-        # Dense 榜单
         for rank, item in enumerate(dense_results, start=1):
             doc_id = item["id"]
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
             id_to_payload[doc_id] = item["payload"]
             id_to_payload[doc_id]["_dense_score"] = item["score"]
 
-        # Sparse 榜单（补全缺失 payload）
         missing_ids = [sid for sid, _ in sparse_results if sid not in id_to_payload]
         if missing_ids:
             for m in self.vector_store.fetch_by_ids(missing_ids):
@@ -424,15 +445,15 @@ class RAGEngine:
     # Rerank（同步 / 异步）
     # =========================================================================
 
-    def _rerank(self, query: str, candidates: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
-        """同步精排。"""
+    def _rerank(
+        self, query: str, candidates: List[Dict[str, Any]], top_k: int
+    ) -> List[Dict[str, Any]]:
         assert self.reranker is not None
         documents = self._build_rerank_docs(candidates)
         rerank_results = self.reranker.rerank(query, documents, top_n=top_k)
         if not rerank_results:
             logger.warning(
-                f"[Reranker] 返回空结果（query='{query[:30]}...'，候选数={len(candidates)}），"
-                "降级为 RRF 排序。请检查 Reranker API key / 模型配置。"
+                f"[Reranker] 返回空结果（query='{query[:30]}...'），降级为 RRF 排序。"
             )
             return candidates[:top_k]
         return self._apply_rerank(candidates, rerank_results)
@@ -440,7 +461,6 @@ class RAGEngine:
     async def _async_rerank(
         self, query: str, candidates: List[Dict[str, Any]], top_k: int
     ) -> List[Dict[str, Any]]:
-        """异步精排。"""
         assert self.reranker is not None
         documents = self._build_rerank_docs(candidates)
         rerank_results = await self.reranker.async_rerank(query, documents, top_n=top_k)
@@ -465,7 +485,6 @@ class RAGEngine:
     def _apply_rerank(
         candidates: List[Dict[str, Any]], rerank_results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """将 reranker 返回的 index/score 映射回候选集。"""
         reranked = []
         for r in rerank_results:
             idx = r.get("index", 0)
@@ -493,16 +512,23 @@ class RAGEngine:
                     "heading_str": payload.get("heading_str", ""),
                     "heading_path": payload.get("heading_path", []),
                     "chunk_index": payload.get("chunk_index", 0),
+                    "section_index": payload.get("section_index", -1),
                     "upload_time": payload.get("upload_time", ""),
                     "score": item.get("rerank_score", item.get("rrf_score", 0.0)),
                     "rrf_score": item.get("rrf_score", 0.0),
                     "dense_score": payload.get("_dense_score", 0.0),
+                    # section_context 由 _expand_sections 填充（advanced 模式）
                 }
             )
         return output
 
     def format_results_for_llm(self, results: List[Dict[str, Any]]) -> str:
-        """将检索结果格式化为适合送入 LLM 的上下文字符串。"""
+        """
+        将检索结果格式化为适合送入 LLM 的上下文字符串。
+
+        advanced 模式下优先使用 section_context（完整 section 文本），
+        basic 模式下使用 content（单个 chunk）。
+        """
         if not results:
             return "未检索到相关内容。"
         parts = []
@@ -511,7 +537,10 @@ class RAGEngine:
             if r["heading_str"]:
                 header += f" | 章节: {r['heading_str']}"
             header += f" | 相关度: {r['score']:.4f}"
-            parts.append(f"{header}\n{r['content']}")
+
+            # advanced 模式使用完整 section 文本，basic 模式使用单 chunk
+            body = r.get("section_context") or r["content"]
+            parts.append(f"{header}\n{body}")
         return "\n\n---\n\n".join(parts)
 
     # =========================================================================
@@ -519,12 +548,10 @@ class RAGEngine:
     # =========================================================================
 
     def collection_stats(self) -> Dict[str, Any]:
-        """返回知识库统计信息。"""
         return self.vector_store.collection_info()
 
     @staticmethod
     def _compute_doc_hash(file_path: str) -> str:
-        """计算文件 SHA-256 哈希，用于去重。"""
         h = hashlib.sha256()
         with open(file_path, "rb") as f:
             for chunk in iter(lambda: f.read(65536), b""):
@@ -549,23 +576,21 @@ def create_rag_engine(
     qdrant_path: str = "./qdrant_data",
     qdrant_collection: str = "rag_docs",
     use_contextual_retrieval: bool = False,
+    rag_mode: str = "basic",
     **kwargs: Any,
 ) -> RAGEngine:
     """
     快速构建 RAGEngine 的工厂函数。
 
-    示例（SiliconFlow 中转站）：
+    示例（普通 RAG）：
+        engine = create_rag_engine(embed_api_key="sf-xxxxx")
+
+    示例（高级 RAG，section 扩展 + Contextual Retrieval）：
         engine = create_rag_engine(
             embed_api_key="sf-xxxxx",
             reranker_api_key="sf-xxxxx",
-        )
-
-    示例（OpenAI 官方）：
-        engine = create_rag_engine(
-            embed_provider="openai",
-            embed_api_key="sk-xxxxx",
-            embed_model="text-embedding-3-small",
-            embed_dim=1536,
+            rag_mode="advanced",
+            use_contextual_retrieval=True,
         )
     """
     from .config import ChunkConfig, EmbeddingConfig, QdrantConfig, RAGConfig, RerankerConfig
@@ -591,6 +616,7 @@ def create_rag_engine(
         ),
         chunk=ChunkConfig(
             use_contextual_retrieval=use_contextual_retrieval,
+            rag_mode=rag_mode,
             **{k: v for k, v in kwargs.items() if k in ChunkConfig.__dataclass_fields__},
         ),
     )

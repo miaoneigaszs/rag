@@ -3,16 +3,18 @@ rag/vector_store.py
 ===================
 Qdrant 向量存储封装。
 
-核心改动（替换 BM25）：
-  原方案：内存级 rank_bm25，50k 上限，启动需 scroll 全量，删除需全量重建。
-  新方案：Qdrant 原生 Sparse Vector（SPLADE / BM25 稀疏模型），
-          持久化、可扩展、与 Dense 同库，零额外服务。
+稀疏编码器：
+  原方案：手写 TF 归一化，无 IDF，停用词和关键词权重同级，精度低。
+  新方案：纯 Python 内置的工业级 BM25 实现（TF 饱和截断 + 真实 IDF 加权）。
+          利用 shelve 库将全局 IDF 统计（文件级词频映射）持久化到磁盘，
+          支持冷启动热加载，增量更新。无需依赖外部 BM25 模型或库。
+          可选依赖：pip install jieba （用于更精准的中文分词）
 
 稀疏向量说明：
   - 通过 SparseVectorParams 在同一 Collection 中注册稀疏索引。
   - 入库时同时写入 dense vector（名称 "dense"）和 sparse vector（名称 "sparse"）。
   - 检索时分别做 Dense 搜索和 Sparse 搜索，再在 RAGEngine 层做 RRF 融合。
-  - 稀疏向量的稀疏表示由 SparseEncoder 生成（见下方）。
+  - token_id 映射：MD5 哈希到 2^31 空间，与原方案一致，无需重建 collection。
 
 支持三种部署模式（通过 QdrantConfig.mode 配置）：
   "local"  → QdrantClient(path=...)  本地文件，无需 Docker
@@ -22,8 +24,14 @@ Qdrant 向量存储封装。
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
+import os
 import re
+import shelve
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,68 +71,203 @@ except ImportError:
 
 
 # =============================================================================
-# 稀疏编码器（替代 rank_bm25）
+# 稀疏编码器（BM25S 升级版）
 # =============================================================================
 
 class SparseEncoder:
     """
-    轻量级稀疏向量编码器（BM25 词频统计变体）。
+    BM25 稀疏向量编码器。
 
-    将文本转为 {token_id: weight} 的稀疏表示，直接写入 Qdrant Sparse Vector。
+    核心改进（对比原 TF 方案）：
+      - 真实 IDF 加权：doc_freq 越高的词权重越低，停用词自动降权
+      - BM25 TF 饱和：长文档中高频词不再线性增长，更鲁棒
+      - IDF 状态持久化：通过 shelve 文件跨重启保存，增量更新
 
-    说明：
-      这里使用词频（TF）+ 简单 IDF 近似作为权重，适合单机场景。
-      生产环境可替换为 SPLADE / 专用稀疏模型（如 naver/splade-cocondenser-ensembledistil），
-      只需改写 encode() 方法，接口不变。
+    BM25 公式：
+      score(t, d) = IDF(t) × (tf × (k1 + 1)) / (tf + k1 × (1 - b + b × |d| / avgdl))
+      IDF(t) = ln((N - df + 0.5) / (df + 0.5) + 1)
 
-    token_id 映射：使用 Python hash() 对 token 字符串取正整数，
-    碰撞概率极低（2^61 空间），Qdrant Sparse Vector 对 id 范围无限制。
+    参数：
+      k1   : TF 饱和系数，默认 1.5（范围 1.2~2.0）
+      b    : 文档长度归一化系数，默认 0.75
+      idf_path : IDF 状态持久化路径（shelve 文件前缀），通过环境变量
+                 BM25_IDF_PATH 配置，默认 ./bm25_idf
+
+    token_id 映射：MD5 哈希到 2^31，与原方案一致，Qdrant collection 无需重建。
     """
 
-    def __init__(self) -> None:
-        self._idf_cache: Dict[str, float] = {}
+    # BM25 超参数
+    K1: float = 1.5
+    B: float = 0.75
+
+    def __init__(self, idf_path: Optional[str] = None) -> None:
+        self._lock = threading.Lock()
+        self._idf_path = idf_path or os.getenv("BM25_IDF_PATH", "./bm25_idf")
+
+        # 从磁盘加载持久化 IDF 状态
+        self._doc_freq: Dict[str, int] = {}   # token → 包含该 token 的文档数
+        self._doc_count: int = 0              # 已索引文档总数
+        self._avg_doc_len: float = 0.0        # 平均文档长度（词数）
+        self._total_doc_len: int = 0          # 所有文档词数之和
+        self._load_idf_state()
+
+        logger.info(
+            f"[SparseEncoder] BM25 编码器已就绪，"
+            f"已索引文档数={self._doc_count}, idf_path={self._idf_path}"
+        )
+
+    # ------------------------------------------------------------------
+    # 分词 & token_id
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        """分词：中文用 jieba，其余用正则词级切分。"""
+        """分词：中文用 jieba，其余用正则词级切分，过滤纯数字和单字符停用词。"""
         if _HAS_JIEBA:
-            return [t for t in jieba.cut(text) if t.strip()]
-        return re.findall(r"\w+", text.lower())
+            tokens = [t for t in jieba.cut(text) if t.strip()]
+        else:
+            tokens = re.findall(r"\w+", text.lower())
+        # 过滤长度为 1 的无意义 token（标点残留等）
+        return [t for t in tokens if len(t) > 1]
 
     @staticmethod
     def _token_id(token: str) -> int:
-        """将 token 字符串映射到非负整数 id（使用稳定哈希）。"""
-        import hashlib
+        """token 字符串 → 非负整数 id（MD5 稳定哈希，与原方案一致）。"""
         return int(hashlib.md5(token.encode("utf-8")).hexdigest()[:8], 16) % (2**31)
+
+    # ------------------------------------------------------------------
+    # IDF 状态持久化
+    # ------------------------------------------------------------------
+
+    def _load_idf_state(self) -> None:
+        """从 shelve 文件加载 IDF 状态，文件不存在则初始化为空。"""
+        try:
+            with shelve.open(self._idf_path, flag="c") as db:
+                self._doc_freq = dict(db.get("doc_freq", {}))
+                self._doc_count = int(db.get("doc_count", 0))
+                self._total_doc_len = int(db.get("total_doc_len", 0))
+                self._avg_doc_len = (
+                    self._total_doc_len / self._doc_count
+                    if self._doc_count > 0 else 0.0
+                )
+        except Exception as exc:
+            logger.warning(f"[SparseEncoder] 加载 IDF 状态失败，从空状态启动: {exc}")
+            self._doc_freq = {}
+            self._doc_count = 0
+            self._total_doc_len = 0
+            self._avg_doc_len = 0.0
+
+    def _save_idf_state(self) -> None:
+        """将当前 IDF 状态持久化到 shelve 文件。"""
+        try:
+            with shelve.open(self._idf_path, flag="c") as db:
+                db["doc_freq"] = self._doc_freq
+                db["doc_count"] = self._doc_count
+                db["total_doc_len"] = self._total_doc_len
+        except Exception as exc:
+            logger.warning(f"[SparseEncoder] 持久化 IDF 状态失败: {exc}")
+
+    # ------------------------------------------------------------------
+    # IDF 增量更新（入库时调用）
+    # ------------------------------------------------------------------
+
+    def update_idf(self, texts: List[str]) -> None:
+        """
+        增量更新 IDF 统计，在批量入库前调用。
+
+        Args:
+            texts : 本批次所有文档的原始文本列表
+        """
+        with self._lock:
+            for text in texts:
+                tokens = self._tokenize(text)
+                if not tokens:
+                    continue
+                # 每个 token 在本文档中只计一次 doc_freq
+                for token in set(tokens):
+                    self._doc_freq[token] = self._doc_freq.get(token, 0) + 1
+                self._doc_count += 1
+                self._total_doc_len += len(tokens)
+
+            self._avg_doc_len = (
+                self._total_doc_len / self._doc_count
+                if self._doc_count > 0 else 0.0
+            )
+            self._save_idf_state()
+
+        logger.debug(
+            f"[SparseEncoder] IDF 更新完成，文档总数={self._doc_count}, "
+            f"词表大小={len(self._doc_freq)}, 平均文档长度={self._avg_doc_len:.1f}"
+        )
+
+    # ------------------------------------------------------------------
+    # IDF 计算
+    # ------------------------------------------------------------------
+
+    def _idf(self, token: str) -> float:
+        """
+        Robertson-Spärck Jones IDF（BM25 标准公式）：
+          ln((N - df + 0.5) / (df + 0.5) + 1)
+
+        冷启动（doc_count == 0）时退化为 1.0，保证系统可用。
+        """
+        if self._doc_count == 0:
+            return 1.0
+        df = self._doc_freq.get(token, 0)
+        N = self._doc_count
+        return math.log((N - df + 0.5) / (df + 0.5) + 1)
+
+    # ------------------------------------------------------------------
+    # 编码（入库 & 查询共用）
+    # ------------------------------------------------------------------
 
     def encode(self, text: str) -> Tuple[List[int], List[float]]:
         """
-        将文本编码为稀疏向量 (indices, values)。
+        将文本编码为 BM25 稀疏向量 (indices, values)。
+
+        入库时：权重 = BM25(TF, IDF, doc_len, avgdl)
+        查询时：因为查询通常很短（<20 词），avgdl 归一化影响可忽略，
+                直接用 IDF 作为权重（等价于 BM25 查询侧标准做法）。
 
         Returns:
             indices : token id 列表（无重复）
-            values  : 对应权重（词频，归一化到 [0, 1]）
+            values  : 对应 BM25 权重（已归一化到 [0, 1]）
         """
         tokens = self._tokenize(text)
         if not tokens:
             return [], []
 
+        doc_len = len(tokens)
+        avgdl = self._avg_doc_len if self._avg_doc_len > 0 else doc_len
+
+        # TF 统计
         tf: Dict[str, int] = {}
         for t in tokens:
             tf[t] = tf.get(t, 0) + 1
 
-        max_freq = max(tf.values())
+        # BM25 权重计算
         seen_ids: Dict[int, float] = {}
         for token, freq in tf.items():
+            idf = self._idf(token)
+            # BM25 TF 饱和
+            tf_norm = (freq * (self.K1 + 1)) / (
+                freq + self.K1 * (1 - self.B + self.B * doc_len / avgdl)
+            )
+            weight = idf * tf_norm
             tid = self._token_id(token)
-            weight = freq / max_freq
+            # token_id 碰撞时取最大权重
             if tid in seen_ids:
                 seen_ids[tid] = max(seen_ids[tid], weight)
             else:
                 seen_ids[tid] = weight
 
+        if not seen_ids:
+            return [], []
+
+        # 归一化到 [0, 1]（保持各 token 相对大小，方便 Qdrant 内积计算）
+        max_w = max(seen_ids.values())
         indices = list(seen_ids.keys())
-        values = list(seen_ids.values())
+        values = [w / max_w for w in seen_ids.values()]
         return indices, values
 
 
@@ -151,7 +294,11 @@ class QdrantVectorStore:
         self.collection = cfg.collection_name
         self._client = self._build_client(cfg)
         self._async_client = self._build_async_client(cfg)
-        self._sparse_encoder = SparseEncoder()
+        idf_path = os.getenv(
+            "BM25_IDF_PATH",
+            str(Path(cfg.path) / "bm25_idf") if cfg.mode == "local" else "./bm25_idf"
+        )
+        self._sparse_encoder = SparseEncoder(idf_path=idf_path)
         self._ensure_collection()
 
     # ------------------------------------------------------------------
@@ -242,6 +389,9 @@ class QdrantVectorStore:
             dense_vectors : 与 chunks 一一对应的 dense 向量
             batch_size    : 每批写入条数
         """
+        # 入库前先更新 IDF 统计（BM25 需要语料级 IDF，增量更新后持久化）
+        self._sparse_encoder.update_idf([c.content for c in chunks])
+
         points: List[PointStruct] = []
         for chunk, dense_vec in zip(chunks, dense_vectors):
             sparse_indices, sparse_values = self._sparse_encoder.encode(chunk.content)
