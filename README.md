@@ -61,6 +61,14 @@
 - DocumentParser 路由（纯文本、降级、FileNotFoundError）
 - 缓存后端（读写、淘汰、后端切换）
 
+### 5. 检索机制增强 (Advanced RAG)
+- **改进型 Contextual Retrieval**：取代原版向 LLM 输入全文生成前缀的昂贵方案，改为按 `section_index` 聚合节内容进行生成，在大幅降低 Token 消耗的同时保证全局视野。支持 Memory/Disk/Redis 三级并发读写缓存。
+- **Section 级扩展 (Parent Document Retrieval)**：新增 `rag_mode="advanced"` 配置。检索命中单点片段后，通过 `section_index` 直接从 Qdrant 拉取该节下所有关联 Chunk，自动拼合为完整上下文返回给下游。
+
+### 6. 文档解析与切块增强
+- **多模态与排版保留**：集成 Docling，保留原文档表格与多栏层级；集成大语言模型（如 GPT-4o-mini）自动为未映射图片生成文本描述，防数据丢失。
+- **孤儿块合并优化**：切块器新增前置向上合并逻辑，对 `< min_chunk_size` 的残缺片段自动并入上一个 Chunk 防止语义断层。
+
 ## 安装
 
 ```bash
@@ -82,6 +90,8 @@ from rag import create_rag_engine
 engine = create_rag_engine(
     embed_api_key="sf-xxxxx",        # SiliconFlow / OpenAI key
     reranker_api_key="sf-xxxxx",
+    rag_mode="advanced",             # 开启 section 级别的上下文自动扩展
+    use_contextual_retrieval=True,   # 开启入库时的 Contextual 上下文摘要生成
 )
 engine.startup_sync()
 
@@ -159,4 +169,12 @@ QDRANT_PATH=./qdrant_data
 # Contextual Retrieval 缓存
 CONTEXTUAL_CACHE_BACKEND=disk   # memory / disk / redis
 CONTEXTUAL_CACHE_DIR=./ctx_cache
+
+# RAG 模式界定
+RAG_MODE=advanced                      # "basic" 或 "advanced" (支持 Section 层级拉取)
+CONTEXT_MODEL=gpt-4o-mini              # 用于 Contextual Retrieval 摘要生成
+
+# Vision (多模态图表解析)
+VISION_MODEL=gpt-4o-mini
+VISION_API_KEY=sk-your-key
 ```
