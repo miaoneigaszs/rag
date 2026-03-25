@@ -284,6 +284,10 @@ class QdrantVectorStore:
 
         logger.info(f"[Qdrant] 已 upsert {len(points)} 个点（dense + sparse）")
 
+    def _format_query_results(self, results: Any) -> List[Dict[str, Any]]:
+        points = getattr(results, "points", results)
+        return [{"id": str(result.id), "score": result.score, "payload": result.payload} for result in points]
+
     def search_dense(
         self,
         query_vector: List[float],
@@ -291,15 +295,26 @@ class QdrantVectorStore:
         score_threshold: float = 0.0,
         filter_conditions: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        results = self._client.search(
-            collection_name=self.collection,
-            query_vector=NamedVector(name=_DENSE_VECTOR_NAME, vector=query_vector),
-            limit=top_k,
-            score_threshold=score_threshold if score_threshold > 0 else None,
-            query_filter=self._build_filter(filter_conditions),
-            with_payload=True,
-        )
-        return [{"id": str(result.id), "score": result.score, "payload": result.payload} for result in results]
+        if hasattr(self._client, "search"):
+            results = self._client.search(
+                collection_name=self.collection,
+                query_vector=NamedVector(name=_DENSE_VECTOR_NAME, vector=query_vector),
+                limit=top_k,
+                score_threshold=score_threshold if score_threshold > 0 else None,
+                query_filter=self._build_filter(filter_conditions),
+                with_payload=True,
+            )
+        else:
+            results = self._client.query_points(
+                collection_name=self.collection,
+                query=query_vector,
+                using=_DENSE_VECTOR_NAME,
+                limit=top_k,
+                score_threshold=score_threshold if score_threshold > 0 else None,
+                query_filter=self._build_filter(filter_conditions),
+                with_payload=True,
+            )
+        return self._format_query_results(results)
 
     def search_sparse(
         self,
@@ -310,17 +325,27 @@ class QdrantVectorStore:
         indices, values = self._sparse_encoder.encode(query)
         if not indices:
             return []
-        results = self._client.search(
-            collection_name=self.collection,
-            query_vector=NamedSparseVector(
-                name=_SPARSE_VECTOR_NAME,
-                vector=SparseVector(indices=indices, values=values),
-            ),
-            limit=top_k,
-            query_filter=self._build_filter(filter_conditions),
-            with_payload=True,
-        )
-        return [{"id": str(result.id), "score": result.score, "payload": result.payload} for result in results]
+        if hasattr(self._client, "search"):
+            results = self._client.search(
+                collection_name=self.collection,
+                query_vector=NamedSparseVector(
+                    name=_SPARSE_VECTOR_NAME,
+                    vector=SparseVector(indices=indices, values=values),
+                ),
+                limit=top_k,
+                query_filter=self._build_filter(filter_conditions),
+                with_payload=True,
+            )
+        else:
+            results = self._client.query_points(
+                collection_name=self.collection,
+                query=SparseVector(indices=indices, values=values),
+                using=_SPARSE_VECTOR_NAME,
+                limit=top_k,
+                query_filter=self._build_filter(filter_conditions),
+                with_payload=True,
+            )
+        return self._format_query_results(results)
 
     def fetch_by_section(self, doc_id: str, section_index: int) -> List[Dict[str, Any]]:
         if section_index == -1:
@@ -347,15 +372,26 @@ class QdrantVectorStore:
         score_threshold: float = 0.0,
         filter_conditions: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        results = await self._async_client.search(
-            collection_name=self.collection,
-            query_vector=NamedVector(name=_DENSE_VECTOR_NAME, vector=query_vector),
-            limit=top_k,
-            score_threshold=score_threshold if score_threshold > 0 else None,
-            query_filter=self._build_filter(filter_conditions),
-            with_payload=True,
-        )
-        return [{"id": str(result.id), "score": result.score, "payload": result.payload} for result in results]
+        if hasattr(self._async_client, "search"):
+            results = await self._async_client.search(
+                collection_name=self.collection,
+                query_vector=NamedVector(name=_DENSE_VECTOR_NAME, vector=query_vector),
+                limit=top_k,
+                score_threshold=score_threshold if score_threshold > 0 else None,
+                query_filter=self._build_filter(filter_conditions),
+                with_payload=True,
+            )
+        else:
+            results = await self._async_client.query_points(
+                collection_name=self.collection,
+                query=query_vector,
+                using=_DENSE_VECTOR_NAME,
+                limit=top_k,
+                score_threshold=score_threshold if score_threshold > 0 else None,
+                query_filter=self._build_filter(filter_conditions),
+                with_payload=True,
+            )
+        return self._format_query_results(results)
 
     async def async_search_sparse(
         self,
@@ -366,17 +402,27 @@ class QdrantVectorStore:
         indices, values = self._sparse_encoder.encode(query)
         if not indices:
             return []
-        results = await self._async_client.search(
-            collection_name=self.collection,
-            query_vector=NamedSparseVector(
-                name=_SPARSE_VECTOR_NAME,
-                vector=SparseVector(indices=indices, values=values),
-            ),
-            limit=top_k,
-            query_filter=self._build_filter(filter_conditions),
-            with_payload=True,
-        )
-        return [{"id": str(result.id), "score": result.score, "payload": result.payload} for result in results]
+        if hasattr(self._async_client, "search"):
+            results = await self._async_client.search(
+                collection_name=self.collection,
+                query_vector=NamedSparseVector(
+                    name=_SPARSE_VECTOR_NAME,
+                    vector=SparseVector(indices=indices, values=values),
+                ),
+                limit=top_k,
+                query_filter=self._build_filter(filter_conditions),
+                with_payload=True,
+            )
+        else:
+            results = await self._async_client.query_points(
+                collection_name=self.collection,
+                query=SparseVector(indices=indices, values=values),
+                using=_SPARSE_VECTOR_NAME,
+                limit=top_k,
+                query_filter=self._build_filter(filter_conditions),
+                with_payload=True,
+            )
+        return self._format_query_results(results)
 
     def fetch_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         results = self._client.retrieve(collection_name=self.collection, ids=ids, with_payload=True)
@@ -411,8 +457,13 @@ class QdrantVectorStore:
 
     def collection_info(self) -> Dict[str, Any]:
         info = self._client.get_collection(self.collection)
+        vectors_count = getattr(info, "vectors_count", None)
+        if vectors_count is None:
+            vectors_count = getattr(info, "indexed_vectors_count", None)
+        if vectors_count is None:
+            vectors_count = getattr(info, "points_count", 0)
         return {
-            "vectors_count": info.vectors_count,
+            "vectors_count": vectors_count,
             "points_count": info.points_count,
             "status": str(info.status),
         }
