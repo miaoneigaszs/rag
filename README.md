@@ -1,85 +1,76 @@
-# Industrial RAG Pipeline v2.0
+# Industrial RAG Pipeline
 
-工业级 RAG Pipeline
-## 目录结构
+一个面向工程演进的 RAG 项目，包含分层切块、Dense + Sparse 混合检索、RRF 融合、可选 rerank、Contextual Retrieval、以及 Docling / Unstructured 解析降级链路。
 
-```
-.
-├── rag/
-│   ├── __init__.py        # 公开 API
-│   ├── config.py          # 所有配置 dataclass（含 __post_init__ 校验）
-│   ├── models.py          # DocumentChunk 数据结构
-│   ├── parser.py          # 文档解析层（Docling → Unstructured → 纯文本）
-│   ├── chunker.py         # 层级感知 Markdown 切块器
-│   ├── embedder.py        # Embedding 服务（sync + async）
-│   ├── contextual.py      # Contextual Retrieval + 三种缓存后端
-│   ├── vector_store.py    # Qdrant 封装（Dense + Sparse 双路）
-│   ├── reranker.py        # Reranker API 封装
-│   └── engine.py          # RAGEngine 主引擎 + create_rag_engine 工厂
-├── tests/
-│   ├── conftest.py
-│   ├── test_config.py
-│   ├── test_models.py
-│   ├── test_chunker.py
-│   ├── test_parser.py
-│   ├── test_vector_store.py
-│   └── test_contextual.py
-└── pyproject.toml
-```
+更多工程化细节见 [docs/工程化改造说明.md](docs/工程化改造说明.md)。
 
-## 核心改动（相比 v1.x 单文件版）
+## 安装分层
 
-### 1. 模块拆分
-原单文件 2000+ 行拆分为 8 个职责单一的模块，每个模块可独立测试和复用。
+### 1. 最小运行依赖
 
-### 2. BM25 → Qdrant Sparse Vector
-| 维度 | v1.x BM25 | v2.0 Sparse Vector |
-|------|-----------|-------------------|
-| 存储 | 内存，重启丢失 | Qdrant 持久化 |
-| 上限 | 50k chunk | 无上限 |
-| 启动 | 需 scroll 全量重建 | 即时可用 |
-| 删除 | 需全量重建索引 | 直接删除点 |
-| 分布式 | 不支持 | Qdrant 原生支持 |
-| 额外服务 | 无（但有内存限制） | 无（复用已有 Qdrant） |
-
-### 3. 代码质量修复
-- `_bm25_remove_by_source` 空实现残留已删除（BM25 整体替换）
-- `reranker._http` 私有属性直接访问 → `reranker.close()` 封装接口
-- `asyncio.get_event_loop()` → `asyncio.get_running_loop()`
-- 所有配置类加入 `__post_init__` 校验，配置错误在构造时即抛出
-- `DocumentChunk.create()` 工厂方法，避免调用方手动 `uuid.uuid4()`
-- Contextual 缓存命中统计从 N+1 查询改为批量预检
-
-### 4. 测试覆盖
-新增 pytest 测试套件，覆盖：
-- 配置校验（正常值 + 边界值 + 非法值）
-- 切块逻辑（标题路径、递归分割、重叠、过滤）
-- DocumentChunk 数据结构（工厂方法、属性、序列化）
-- SparseEncoder（空文本、去重、权重范围、确定性）
-- RRF 融合算法（公式验证、top_k、边界）
-- DocumentParser 路由（纯文本、降级、FileNotFoundError）
-- 缓存后端（读写、淘汰、后端切换）
-
-### 5. 检索机制增强 (Advanced RAG)
-- **改进型 Contextual Retrieval**：取代原版向 LLM 输入全文生成前缀的昂贵方案，改为按 `section_index` 聚合节内容进行生成，在大幅降低 Token 消耗的同时保证全局视野。支持 Memory/Disk/Redis 三级并发读写缓存。
-- **Section 级扩展 (Parent Document Retrieval)**：新增 `rag_mode="advanced"` 配置。检索命中单点片段后，通过 `section_index` 直接从 Qdrant 拉取该节下所有关联 Chunk，自动拼合为完整上下文返回给下游。
-
-### 6. 文档解析与切块增强
-- **多模态与排版保留**：集成 Docling，保留原文档表格与多栏层级；集成大语言模型（如 GPT-4o-mini）自动为未映射图片生成文本描述，防数据丢失。
-- **孤儿块合并优化**：切块器新增前置向上合并逻辑，对 `< min_chunk_size` 的残缺片段自动并入上一个 Chunk 防止语义断层。
-
-## 安装
+适合本地开发、单元测试、阅读代码。
 
 ```bash
-# 基础（不含文档解析器）
 pip install -e .
-
-# 完整安装
-pip install -e ".[all]"
-
-# 仅开发依赖
-pip install -e ".[dev]"
 ```
+
+### 2. 主检索链路
+
+适合实际运行 embedding + Qdrant 检索。
+
+```bash
+pip install -e ".[runtime,cache]"
+```
+
+### 3. 完整功能
+
+包含文档解析、缓存后端、开发测试工具。
+
+```bash
+pip install -e ".[all]"
+```
+
+### 4. requirements 文件
+
+如果你更习惯 `pip -r`：
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+pip install -r requirements-all.txt
+```
+
+## Extras 说明
+
+- `runtime`: `openai`、`httpx`、`qdrant-client`
+- `cache`: `diskcache`、`redis`
+- `parsing`: `docling`、`unstructured[all-docs]` 及其相关依赖
+- `dev`: `pytest`、`pytest-cov`、`ruff`、`pre-commit`
+- `all`: 全部功能与开发依赖
+
+## 环境变量
+
+复制 `.env.example` 后按需修改：
+
+```bash
+cp .env.example .env
+```
+
+最小可运行配置通常至少需要：
+
+```bash
+EMBED_PROVIDER=proxy
+PROXY_API_KEY=sf-your-key
+RERANKER_API_KEY=sf-your-key
+QDRANT_MODE=local
+QDRANT_PATH=./qdrant_data
+```
+
+说明：
+
+- 如果使用 OpenAI 官方 embedding，把 `EMBED_PROVIDER` 改成 `openai` 并设置 `OPENAI_API_KEY`。
+- `Contextual Retrieval` 默认关闭，开启后通常还需要 `openai` 相关能力。
+- 多模态图片描述能力使用 `VISION_*` 变量。
 
 ## 快速开始
 
@@ -87,93 +78,107 @@ pip install -e ".[dev]"
 from rag import create_rag_engine
 
 engine = create_rag_engine(
-    embed_api_key="sf-xxxxx",        # SiliconFlow / OpenAI key
+    embed_api_key="sf-xxxxx",
     reranker_api_key="sf-xxxxx",
-    rag_mode="advanced",             # 开启 section 级别的上下文自动扩展
-    use_contextual_retrieval=True,   # 开启入库时的 Contextual 上下文摘要生成
+    rag_mode="advanced",
+    use_contextual_retrieval=True,
 )
 engine.startup_sync()
 
-# 索引文档
 engine.index_file("document.pdf")
-
-# 检索
 results = engine.retrieve("如何配置环境变量？", top_k=5)
 print(engine.format_results_for_llm(results))
-
-# 关闭
-import asyncio
-asyncio.run(engine.shutdown())
 ```
 
-## FastAPI 集成
+## 目录结构
+
+```text
+.
+├── rag/
+│   ├── __init__.py
+│   ├── chunker.py
+│   ├── config.py
+│   ├── contextual.py
+│   ├── embedder.py
+│   ├── engine.py
+│   ├── models.py
+│   ├── parser.py
+│   ├── reranker.py
+│   └── vector_store.py
+├── tests/
+├── docs/
+├── .env.example
+├── .pre-commit-config.yaml
+├── pyproject.toml
+└── .github/workflows/ci.yml
+```
+
+## 代码质量
+
+仓库现在提供最小可用的 `ruff + pre-commit` 基线，先覆盖最常见的问题：
+
+- import 排序
+- 明显的语法/未定义变量错误
+- 基础 bug 风险检查
+- 行尾空格、缺失 EOF newline、YAML/TOML 基本校验
+
+安装与使用：
+
+```bash
+pip install -r requirements-dev.txt
+pre-commit install
+pre-commit run --all-files
+ruff check .
+```
+
+说明：
+
+- 当前只接入 `ruff check --fix`，还没有启用 `ruff format`。
+- 这是刻意保守的“半步”方案，先把静态检查接入，再决定是否统一格式化全仓库。
+
+## 效果评测
+
+仓库现在提供一个轻量评测入口，可以直接对小型 query 集合计算 `hit_rate@k`、`recall@k` 和 `MRR@k`。
 
 ```python
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from rag import create_rag_engine
+from rag import RetrievalEvalCase, evaluate_engine
 
-engine = create_rag_engine(embed_api_key="...", reranker_api_key="...")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await engine.startup()
-    yield
-    await engine.shutdown()
-
-app = FastAPI(lifespan=lifespan)
-
-@app.post("/retrieve")
-async def retrieve(query: str, top_k: int = 5):
-    results = await engine.retrieve_async(query=query, top_k=top_k)
-    return engine.format_results_for_llm(results)
+cases = [
+    RetrievalEvalCase(query="如何配置环境变量？", expected_ids=["doc-id-or-source-path"]),
+]
+summary = evaluate_engine(engine, cases, top_k=5)
+print(summary.to_dict())
 ```
 
-## 运行测试
+如果你同时想看最近一次检索链路的耗时与召回量：
+
+```python
+stats = engine.get_last_retrieval_stats()
+print(stats)
+```
+
+## 测试
+
+本地执行：
 
 ```bash
-# 运行全部测试
-pytest
-
-# 带覆盖率报告
-pytest --cov=rag --cov-report=term-missing
-
-# 仅运行某个模块的测试
-pytest tests/test_chunker.py -v
+python -m compileall rag tests
+pytest -q
 ```
 
-## 环境变量配置
+当前基线：
 
-```bash
-# Embedding（SiliconFlow）
-EMBED_PROVIDER=proxy
-PROXY_API_KEY=sf-your-key
-PROXY_BASE_URL=https://api.siliconflow.cn/v1
-PROXY_EMBED_MODEL=BAAI/bge-large-zh-v1.5
-EMBED_DIM=1024
+- `78 passed`
+- `1 skipped`
 
-# Embedding（OpenAI）
-EMBED_PROVIDER=openai
-OPENAI_API_KEY=sk-your-key
-EMBED_DIM=1536
+跳过项为 `docling` 可选依赖相关测试，未安装时跳过属于预期行为。
 
-# Reranker
-RERANKER_API_KEY=sf-your-key
-RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+## CI
 
-# Qdrant（本地文件，默认）
-QDRANT_MODE=local
-QDRANT_PATH=./qdrant_data
+仓库已提供 GitHub Actions 工作流：
 
-# Contextual Retrieval 缓存
-CONTEXTUAL_CACHE_BACKEND=disk   # memory / disk / redis
-CONTEXTUAL_CACHE_DIR=./ctx_cache
+- 安装 `.[dev]`
+- 执行 `python -m compileall rag tests`
+- 执行 `pytest -q`
 
-# RAG 模式界定
-RAG_MODE=advanced                      # "basic" 或 "advanced" (支持 Section 层级拉取)
-CONTEXT_MODEL=gpt-4o-mini              # 用于 Contextual Retrieval 摘要生成
-
-# Vision (多模态图表解析)
-VISION_MODEL=gpt-4o-mini
-VISION_API_KEY=sk-your-key
-```
+工作流文件见 [.github/workflows/ci.yml](.github/workflows/ci.yml)。

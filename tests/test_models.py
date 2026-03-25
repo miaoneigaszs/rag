@@ -1,8 +1,4 @@
-"""
-tests/test_models.py
-====================
-DocumentChunk 数据结构测试。
-"""
+"""DocumentChunk 测试。"""
 
 import pytest
 
@@ -11,12 +7,12 @@ from rag.models import DocumentChunk
 
 class TestDocumentChunkCreate:
     def test_auto_generates_uuid(self):
-        c1 = DocumentChunk.create(doc_id="d1", content="hello")
-        c2 = DocumentChunk.create(doc_id="d1", content="hello")
-        assert c1.chunk_id != c2.chunk_id  # 每次调用应生成不同 UUID
+        chunk1 = DocumentChunk.create(doc_id="d1", content="hello")
+        chunk2 = DocumentChunk.create(doc_id="d1", content="hello")
+        assert chunk1.chunk_id != chunk2.chunk_id
 
     def test_char_count_set_correctly(self):
-        content = "这是测试内容"
+        content = "中文内容"
         chunk = DocumentChunk.create(doc_id="d", content=content)
         assert chunk.char_count == len(content)
 
@@ -39,13 +35,18 @@ class TestDocumentChunkProperties:
         assert chunk.heading_str == "H1 > H2 > H3"
 
     def test_full_text_for_embed_without_prefix(self):
-        chunk = DocumentChunk.create(doc_id="d", content="内容")
-        assert chunk.full_text_for_embed == "内容"
+        chunk = DocumentChunk.create(doc_id="d", content="正文")
+        assert chunk.full_text_for_embed == "正文"
 
     def test_full_text_for_embed_with_prefix(self):
-        chunk = DocumentChunk.create(doc_id="d", content="内容")
+        chunk = DocumentChunk.create(doc_id="d", content="正文")
         chunk.context_prefix = "摘要"
-        assert chunk.full_text_for_embed == "摘要\n\n内容"
+        assert chunk.full_text_for_embed == "摘要\n\n正文"
+
+    def test_full_text_for_embed_with_heading_and_prefix(self):
+        chunk = DocumentChunk.create(doc_id="d", content="正文", heading_path=["一级标题"])
+        chunk.context_prefix = "摘要"
+        assert chunk.full_text_for_embed == "一级标题\n\n摘要\n\n正文"
 
 
 class TestDocumentChunkToPayload:
@@ -54,13 +55,24 @@ class TestDocumentChunkToPayload:
             doc_id="doc123",
             content="测试内容",
             source_file="test.pdf",
-            heading_path=["第一章"],
+            source_path="/abs/test.pdf",
+            heading_path=["测试标题"],
         )
         payload = chunk.to_payload()
         required = {
-            "chunk_id", "doc_id", "content", "context_prefix",
-            "source_file", "file_type", "heading_path", "heading_str",
-            "chunk_index", "char_count", "upload_time",
+            "chunk_id",
+            "doc_id",
+            "content",
+            "context_prefix",
+            "source_file",
+            "source_path",
+            "file_type",
+            "heading_path",
+            "heading_str",
+            "chunk_index",
+            "section_index",
+            "char_count",
+            "upload_time",
         }
         assert required.issubset(payload.keys())
 
@@ -71,19 +83,18 @@ class TestDocumentChunkToPayload:
 
     def test_extra_meta_merged_into_payload(self):
         chunk = DocumentChunk.create(
-            doc_id="d", content="c", extra_meta={"author": "Alice", "tag": "test"}
+            doc_id="d",
+            content="c",
+            extra_meta={"author": "Alice", "tag": "test"},
         )
         payload = chunk.to_payload()
         assert payload["author"] == "Alice"
         assert payload["tag"] == "test"
 
-    def test_extra_meta_does_not_override_core_fields(self):
-        """extra_meta 不应能覆盖核心字段（content、doc_id 等）。"""
-        chunk = DocumentChunk.create(
-            doc_id="real_id", content="real_content", extra_meta={"doc_id": "fake_id"}
-        )
-        payload = chunk.to_payload()
-        # extra_meta 在 **kwargs 展开，core 字段已先写入；Python dict update 语义决定后者覆盖
-        # 这里记录当前行为（extra_meta 中同名 key 会覆盖），并作为回归测试
-        # 若将来修改 to_payload() 加入保护，此测试可同步更新
-        assert "doc_id" in payload  # 保证字段存在
+    def test_extra_meta_cannot_override_core_fields(self):
+        with pytest.raises(ValueError, match="保留字段"):
+            DocumentChunk.create(
+                doc_id="real_id",
+                content="real_content",
+                extra_meta={"doc_id": "fake_id"},
+            )

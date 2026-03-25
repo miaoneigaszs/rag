@@ -1,24 +1,73 @@
 [project]
 name = "rag"
 version = "0.1.0"
-description = "Add your description here"
+description = "Industrial RAG pipeline with hierarchical chunking, hybrid retrieval, and optional advanced parsing"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "diskcache>=5.6.3",
-    "docling>=2.81.0",
     "loguru>=0.7.3",
-    "openai>=2.29.0",
-    "pillow>=12.1.1",
-    "pydantic>=2.12.5",
-    "pytest>=9.0.2",
-    "python-docx>=1.2.0",
     "python-dotenv>=1.2.2",
-    "python-magic>=0.4.27",
-    "python-pptx>=1.0.2",
-    "qdrant-client>=1.17.1",
-    "redis>=7.3.0",
     "tenacity>=9.1.4",
     "tqdm>=4.67.3",
-    "unstructured[all-docs]>=0.21.5",
 ]
+
+[project.optional-dependencies]
+runtime = [
+    "openai>=2.29.0",
+    "httpx>=0.28.1",
+    "qdrant-client>=1.17.1",
+]
+cache = [
+    "diskcache>=5.6.3",
+    "redis>=7.3.0",
+]
+parsing = [
+    "docling>=2.81.0",
+    "unstructured[all-docs]>=0.21.5",
+    "pillow>=12.1.1",
+    "python-magic>=0.4.27",
+    "python-pptx>=1.0.2",
+    "python-docx>=1.2.0",
+]
+dev = [
+    "pre-commit>=4.2.0",
+    "pytest>=9.0.2",
+    "pytest-cov>=6.1.1",
+    "ruff>=0.11.13",
+]
+all = [
+    "openai>=2.29.0",
+    "httpx>=0.28.1",
+    "qdrant-client>=1.17.1",
+    "diskcache>=5.6.3",
+    "redis>=7.3.0",
+    "docling>=2.81.0",
+    "unstructured[all-docs]>=0.21.5",
+    "pillow>=12.1.1",
+    "python-magic>=0.4.27",
+    "python-pptx>=1.0.2",
+    "python-docx>=1.2.0",
+    "pre-commit>=4.2.0",
+    "pytest>=9.0.2",
+    "pytest-cov>=6.1.1",
+    "ruff>=0.11.13",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "rag/Output_Markdown",
+    "rag/tutorial_images",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["B011"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

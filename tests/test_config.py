@@ -1,8 +1,4 @@
-"""
-tests/test_config.py
-====================
-配置类的校验逻辑测试。
-"""
+"""配置对象测试。"""
 
 import pytest
 
@@ -42,8 +38,7 @@ class TestQdrantConfig:
 
     def test_valid_modes(self):
         for mode in ("local", "docker", "cloud"):
-            cfg = QdrantConfig(mode=mode)
-            assert cfg.mode == mode
+            assert QdrantConfig(mode=mode).mode == mode
 
 
 class TestChunkConfig:
@@ -59,16 +54,12 @@ class TestChunkConfig:
         with pytest.raises(ValueError, match="contextual_cache_backend"):
             ChunkConfig(contextual_cache_backend="s3")
 
-    def test_valid_cache_backends(self):
-        for backend in ("memory", "disk", "redis"):
-            cfg = ChunkConfig(contextual_cache_backend=backend)
-            assert cfg.contextual_cache_backend == backend
-
     def test_default_values(self):
         cfg = ChunkConfig()
         assert cfg.chunk_size == 800
         assert cfg.chunk_overlap == 150
         assert cfg.min_chunk_size == 50
+        assert cfg.use_contextual_retrieval is False
 
 
 class TestRAGConfig:

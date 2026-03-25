@@ -32,9 +32,13 @@ env/
 qdrant_data/
 # Contextual Retrieval 摘要缓存 (DiskCache)
 contextual_cache/
+# BM25 持久化统计
+bm25_idf*
 # 解析过程中从 PDF/PPT 提取出的图片目录
-# (匹配模式: 文件名_images/)
 *_images/
+# 本地解析输出产物
+rag/Output_Markdown/
+rag/output.md
 
 # --- OS Specific ---
 .DS_Store

@@ -16,19 +16,48 @@ rag
 """
 
 from .config import ChunkConfig, EmbeddingConfig, QdrantConfig, RAGConfig, RerankerConfig
-from .engine import RAGEngine, create_rag_engine
+from .evaluation import RetrievalEvalCase, RetrievalEvalResult, RetrievalEvalSummary
 from .models import DocumentChunk
 
+
+def create_rag_engine(*args, **kwargs):
+    from .engine import create_rag_engine as _create_rag_engine
+
+    return _create_rag_engine(*args, **kwargs)
+
+
+def evaluate_engine(*args, **kwargs):
+    from .evaluation import evaluate_engine as _evaluate_engine
+
+    return _evaluate_engine(*args, **kwargs)
+
+
+def evaluate_retriever(*args, **kwargs):
+    from .evaluation import evaluate_retriever as _evaluate_retriever
+
+    return _evaluate_retriever(*args, **kwargs)
+
+
+def __getattr__(name: str):
+    if name == "RAGEngine":
+        from .engine import RAGEngine
+
+        return RAGEngine
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
-    # 引擎
     "RAGEngine",
     "create_rag_engine",
-    # 配置
+    "evaluate_engine",
+    "evaluate_retriever",
     "RAGConfig",
     "EmbeddingConfig",
     "RerankerConfig",
     "QdrantConfig",
     "ChunkConfig",
-    # 数据结构
     "DocumentChunk",
+    "RetrievalEvalCase",
+    "RetrievalEvalResult",
+    "RetrievalEvalSummary",
 ]

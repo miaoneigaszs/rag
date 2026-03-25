@@ -1,25 +1,2 @@
-# 核心框架
-docling
-unstructured[all-docs]
-loguru
-python-dotenv
-
-# 向量数据库与检索
-qdrant-client
-openai
-pydantic
-tenacity
-httpx
-
-# 图片处理与多模态
-pillow
-python-magic  # Unstructured 识别文件类型所需
-python-pptx   # 处理 PPTX 所需
-python-docx   # 处理 DOCX 所需
-
-# 其他工具
-redis         # 如果开启了 Redis 缓存后端
-diskcache     # 默认的磁盘缓存后端
-tqdm          # 进度条显示
-pytest
-tenacity
+# 最小可运行安装：Embedding + Qdrant 检索链路
+-e .[runtime,cache]

@@ -1,0 +1,3 @@
+{"query": "如何配置环境变量？", "expected_ids": ["/abs/path/to/config-doc.md"], "metadata": {"bucket": "config", "notes": "单文档命中"}}
+{"query": "索引文件时如何避免旧 chunk 残留？", "expected_ids": ["/abs/path/to/engine-doc.md"], "metadata": {"bucket": "procedure", "notes": "关注重建索引逻辑"}}
+{"query": "advanced 模式下 section 扩展是怎么工作的？", "expected_ids": ["/abs/path/to/retrieval-doc.md"], "metadata": {"bucket": "cross_section", "notes": "关注 section expansion"}}
