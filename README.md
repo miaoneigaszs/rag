@@ -141,11 +141,9 @@ ruff check .
 仓库现在提供一个轻量评测入口，可以直接对小型 query 集合计算 `hit_rate@k`、`recall@k` 和 `MRR@k`。
 
 ```python
-from rag import RetrievalEvalCase, evaluate_engine
+from rag import evaluate_engine, load_eval_cases
 
-cases = [
-    RetrievalEvalCase(query="如何配置环境变量？", expected_ids=["doc-id-or-source-path"]),
-]
+cases = load_eval_cases("docs/eval_dataset_v4.jsonl")
 summary = evaluate_engine(engine, cases, top_k=5)
 print(summary.to_dict())
 ```

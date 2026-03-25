@@ -16,7 +16,12 @@ rag
 """
 
 from .config import ChunkConfig, EmbeddingConfig, QdrantConfig, RAGConfig, RerankerConfig
-from .evaluation import RetrievalEvalCase, RetrievalEvalResult, RetrievalEvalSummary
+from .evaluation import (
+    RetrievalEvalCase,
+    RetrievalEvalResult,
+    RetrievalEvalSummary,
+    load_eval_cases,
+)
 from .models import DocumentChunk
 
 
@@ -51,6 +56,7 @@ __all__ = [
     "create_rag_engine",
     "evaluate_engine",
     "evaluate_retriever",
+    "load_eval_cases",
     "RAGConfig",
     "EmbeddingConfig",
     "RerankerConfig",

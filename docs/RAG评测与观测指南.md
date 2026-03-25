@@ -4,7 +4,7 @@
 
 这份文档用于把当前仓库的 RAG 优化过程从“凭感觉调参”变成“带指标迭代”。
 
-当前仓库已经提供两类基础能力：
+当前仓库已经提供三类基础能力：
 
 1. 检索链路观测
    - `engine.get_last_index_stats()`
@@ -12,6 +12,8 @@
 2. 轻量评测入口
    - `rag.evaluate_engine()`
    - `rag.evaluate_retriever()`
+3. JSONL 数据集加载
+   - `rag.load_eval_cases()`
 
 ## 你现在能直接看什么
 
@@ -69,59 +71,65 @@ print(stats)
 
 建议分桶：
 
-- `factoid`: 事实型问题
-- `procedure`: 步骤型问题
-- `config`: 配置型问题
-- `summary`: 总结型问题
-- `cross_section`: 需要 section 扩展的问题
+- `fact_extraction`: 事实提取
+- `technical_explanation`: 技术解释
+- `complex_condition`: 条件型规则
+- `multi_fact`: 多事实提取
+- `table_extraction`: 表格数值提取
+- `financial_extraction`: 财报/金融 PDF 抽取
 
-仓库里已附带模板文件：
+仓库里现在有两份参考文件：
 
 - [eval_dataset_template.jsonl](D:/learnsomething/rag/docs/eval_dataset_template.jsonl)
+- [eval_dataset_v4.jsonl](D:/learnsomething/rag/docs/eval_dataset_v4.jsonl)
 
-## 模板格式
+## 推荐 schema
 
 每行一个 JSON：
 
 ```json
-{"query": "如何配置环境变量？", "expected_ids": ["/abs/path/doc.md"], "metadata": {"bucket": "config"}}
+{
+  "id": "eval_001",
+  "query": "如何配置环境变量？",
+  "expected_ids": ["docs/fastapi_docs/environment-variables.md"],
+  "expected_heading": "环境变量",
+  "ground_truth": "......",
+  "difficulty": "easy",
+  "multi_hop": false,
+  "metadata": {
+    "bucket": "technical_explanation",
+    "notes": "测试基础配置说明",
+    "doc_type": "技术文档"
+  }
+}
 ```
 
 字段说明：
 
+- `id`: 样本唯一编号
 - `query`: 用户问题
-- `expected_ids`: 期望命中的标识，可填 `doc_id`、`source_path` 或 `source_file`
-- `metadata`: 可选，用于分桶分析
+- `expected_ids`: 期望命中的标识，推荐使用相对仓库根目录的稳定路径
+- `expected_heading`: 可选，用于评测是否命中正确章节
+- `ground_truth`: 可选，后续用于答案质量评测
+- `difficulty`: 可选，样本难度标签
+- `multi_hop`: 可选，是否跨段/跨节
+- `metadata.bucket`: 推荐的分桶字段
 
-推荐优先使用 `source_path`，因为最稳定。
+不再推荐只写 basename，例如 `README.md` 或 `async.md`，因为很容易串档。
 
 ## 评测示例
 
 ```python
-import json
-from pathlib import Path
-from rag import RetrievalEvalCase, evaluate_engine
+from rag import evaluate_engine, load_eval_cases
 
-cases = []
-for line in Path("docs/eval_dataset_template.jsonl").read_text(encoding="utf-8").splitlines():
-    if not line.strip():
-        continue
-    item = json.loads(line)
-    cases.append(
-        RetrievalEvalCase(
-            query=item["query"],
-            expected_ids=item["expected_ids"],
-            metadata=item.get("metadata", {}),
-        )
-    )
-
+cases = load_eval_cases("docs/eval_dataset_v4.jsonl")
 summary = evaluate_engine(engine, cases, top_k=5)
 print(summary.to_dict())
 ```
 
 ## 当前默认关注指标
 
-第一阶段先盯这三个：
+第一阶段先盯这四个：
 
 1. `hit_rate@5`
    - 前 5 条结果里是否至少命中一个正确文档
@@ -129,6 +137,8 @@ print(summary.to_dict())
    - 如果问题对应多个正确文档，前 5 条覆盖了多少
 3. `MRR@5`
    - 第一个正确结果排得是否足够靠前
+4. `heading_hit_rate@5`
+   - 如果样本给了 `expected_heading`，是否命中了正确章节
 
 ## 建议的实验顺序
 
@@ -141,15 +151,12 @@ print(summary.to_dict())
 
 每次只改一个变量，否则结论不稳。
 
-## 我最需要你提供的帮助
+## 你后续最值得补的数据
 
-如果你要我继续把效果往上做，最有价值的是你给我这两类真实材料：
+如果你要继续让我提升效果，最有价值的是：
 
-1. 用于索引的真实文档
-   - 3 到 10 份就够
-   - 最好包含你实际关心的 PDF / Markdown / DOCX
-2. 真实问题清单
-   - 10 到 30 条
-   - 每条问题最好标明正确文档路径，或者告诉我答案在哪份文档里
+1. 把 `ground_truth` 里的占位语句补成真实答案
+2. 对关键样本补 `expected_heading`
+3. 再加 10 到 30 条真实业务 query
 
-如果你愿意，下一步可以直接把这些文档和问题给我，我会基于这套模板帮你落第一版真实评测集，并开始做效果优化。
+这样下一步就能从“检索命中评测”继续升级到“回答质量评测”。
