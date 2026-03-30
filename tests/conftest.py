@@ -1,13 +1,30 @@
 """pytest 公共 fixture。"""
 
+import shutil
 from pathlib import Path
 import sys
+import uuid
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture()
+def tmp_path() -> Path:
+    """
+    自定义 tmp_path，绕开部分 Windows 环境中 pytest 内置 tmpdir 清理权限问题。
+    """
+    runtime_root = ROOT / "pytest_tmp_runtime"
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    path = runtime_root / f"case_{uuid.uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=False)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")

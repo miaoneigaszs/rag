@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from rag.config import ChunkConfig, RAGConfig, RerankerConfig
-from rag.vector_store import SparseEncoder
+from rag.models import DocumentChunk
+from rag.vector_store import QdrantVectorStore, SparseEncoder
 import rag.engine as engine_module
 
 
@@ -130,3 +131,46 @@ class TestRRFFusion:
 
     def test_empty_inputs_return_empty(self, engine):
         assert engine._rrf_fusion([], [], top_k=5) == []
+
+
+class TestQdrantUpsertRollback:
+    def test_upsert_rolls_back_idf_on_failure(self):
+        store = QdrantVectorStore.__new__(QdrantVectorStore)
+        store.collection = "test_collection"
+        store._client = MagicMock()
+        store._client.upsert.side_effect = RuntimeError("upsert failed")
+        store._sparse_encoder = MagicMock()
+        store._sparse_encoder.encode.return_value = ([1], [1.0])
+
+        chunk = DocumentChunk.create(doc_id="doc-1", content="hello world")
+
+        with pytest.raises(RuntimeError, match="upsert failed"):
+            store.upsert([chunk], [[0.1, 0.2]])
+
+        store._sparse_encoder.update_idf.assert_called_once_with(["hello world"])
+        store._sparse_encoder.remove_idf.assert_called_once_with(["hello world"])
+        store._client.delete.assert_not_called()
+
+    def test_upsert_removes_partially_written_points_on_failure(self):
+        store = QdrantVectorStore.__new__(QdrantVectorStore)
+        store.collection = "test_collection"
+        store._client = MagicMock()
+        store._client.upsert.side_effect = [None, RuntimeError("second batch failed")]
+        store._sparse_encoder = MagicMock()
+        store._sparse_encoder.encode.return_value = ([1], [1.0])
+
+        chunk1 = DocumentChunk.create(doc_id="doc-1", content="chunk one")
+        chunk2 = DocumentChunk.create(doc_id="doc-1", content="chunk two")
+
+        with pytest.raises(RuntimeError, match="second batch failed"):
+            store.upsert([chunk1, chunk2], [[0.1, 0.2], [0.3, 0.4]], batch_size=1)
+
+        store._sparse_encoder.remove_idf.assert_called_once_with(["chunk one", "chunk two"])
+        store._client.delete.assert_called_once()
+
+        selector = store._client.delete.call_args.kwargs["points_selector"]
+        first_chunk_id = str(chunk1.chunk_id)
+        if hasattr(selector, "points"):
+            assert first_chunk_id in [str(point_id) for point_id in selector.points]
+        else:
+            assert first_chunk_id in [str(point_id) for point_id in selector]

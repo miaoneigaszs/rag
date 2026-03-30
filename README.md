@@ -70,7 +70,8 @@ QDRANT_PATH=./qdrant_data
 
 - 如果使用 OpenAI 官方 embedding，把 `EMBED_PROVIDER` 改成 `openai` 并设置 `OPENAI_API_KEY`。
 - `Contextual Retrieval` 默认关闭，开启后通常还需要 `openai` 相关能力。
-- 多模态图片描述能力使用 `VISION_*` 变量。
+- 多模态图片描述默认关闭，设置 `VISION_ENABLED=true` 后才会调用 `VISION_*` 变量。
+- 图片描述接口超时可通过 `VISION_TIMEOUT_SECONDS` 控制（默认 `15` 秒）。
 
 ## 快速开始
 

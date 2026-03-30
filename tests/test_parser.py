@@ -66,6 +66,18 @@ class TestSupportedExtensions:
 
 
 class TestImageAndMultimodalParsing:
+    def test_get_image_caption_skips_when_vision_disabled(self, parser):
+        parser._vision_enabled = False
+        assert parser._get_image_caption(b"fake-image-bytes") == ""
+
+    def test_get_image_caption_returns_empty_without_api_key(self, monkeypatch):
+        monkeypatch.setenv("VISION_ENABLED", "true")
+        monkeypatch.delenv("VISION_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        parser = DocumentParser()
+        assert parser._get_image_caption(b"fake-image-bytes") == ""
+
     def test_docling_image_extraction_logic(self, parser, tmp_path, monkeypatch):
         if importlib.util.find_spec("docling") is None:
             pytest.skip("docling 未安装，跳过图片提取逻辑测试")

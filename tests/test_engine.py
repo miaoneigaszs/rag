@@ -126,6 +126,55 @@ class TestRAGEngineIndexing:
             assert stats["embed_ms"] >= 0.0
             assert stats["upsert_ms"] >= 0.0
 
+    def test_index_file_returns_error_when_upsert_fails(self, tmp_path):
+        file_path = tmp_path / "doc.md"
+        file_path.write_text("# 标题\n\n正文", encoding="utf-8")
+
+        with (
+            patch.object(engine_module, "EmbeddingService") as embedder_cls,
+            patch.object(engine_module, "QdrantVectorStore") as vector_store_cls,
+            patch.object(engine_module, "DocumentParser") as parser_cls,
+            patch.object(engine_module, "HierarchicalMarkdownSplitter") as splitter_cls,
+        ):
+            embedder = MagicMock()
+            embedder.embed_all.return_value = [[0.1, 0.2]]
+            embedder_cls.return_value = embedder
+
+            vector_store = MagicMock()
+            vector_store.doc_exists.return_value = False
+            vector_store.collection_info.return_value = {}
+            vector_store.upsert.side_effect = RuntimeError("qdrant unavailable")
+            vector_store_cls.return_value = vector_store
+
+            parser = MagicMock()
+            parser.parse.return_value = ("# 标题\n\n正文", "markdown")
+            parser_cls.return_value = parser
+
+            splitter = MagicMock()
+            splitter.split.return_value = [
+                {
+                    "content": "正文",
+                    "heading_path": ["标题"],
+                    "chunk_index": 0,
+                    "section_index": 0,
+                }
+            ]
+            splitter_cls.return_value = splitter
+
+            engine = engine_module.RAGEngine(
+                RAGConfig(
+                    reranker=RerankerConfig(api_key=""),
+                    chunk=ChunkConfig(use_contextual_retrieval=False),
+                )
+            )
+            result = engine.index_file(str(file_path), force_reindex=True)
+            stats = engine.get_last_index_stats()
+
+            assert result["status"] == "error"
+            assert "Upsert 失败" in result["error"]
+            assert stats["status"] == "error"
+            assert "Upsert 失败" in stats["error"]
+
 
 class TestRAGEngineRetrievalObservability:
     def test_retrieve_records_observability(self):

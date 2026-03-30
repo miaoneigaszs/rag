@@ -260,29 +260,65 @@ class QdrantVectorStore:
         dense_vectors: List[List[float]],
         batch_size: int = 64,
     ) -> None:
-        self._sparse_encoder.update_idf([chunk.content for chunk in chunks])
+        if len(chunks) != len(dense_vectors):
+            raise ValueError("chunks 与 dense_vectors 长度不一致，无法 upsert")
+        if not chunks:
+            return
 
+        texts = [chunk.content for chunk in chunks]
+        self._sparse_encoder.update_idf(texts)
         points: List[Any] = []
-        for chunk, dense_vec in zip(chunks, dense_vectors):
-            sparse_indices, sparse_values = self._sparse_encoder.encode(chunk.content)
-            points.append(
-                PointStruct(
-                    id=chunk.chunk_id,
-                    vector={
-                        _DENSE_VECTOR_NAME: dense_vec,
-                        _SPARSE_VECTOR_NAME: SparseVector(indices=sparse_indices, values=sparse_values),
-                    },
-                    payload=chunk.to_payload(),
+        inserted_ids: List[str] = []
+        try:
+            for chunk, dense_vec in zip(chunks, dense_vectors):
+                sparse_indices, sparse_values = self._sparse_encoder.encode(chunk.content)
+                points.append(
+                    PointStruct(
+                        id=chunk.chunk_id,
+                        vector={
+                            _DENSE_VECTOR_NAME: dense_vec,
+                            _SPARSE_VECTOR_NAME: SparseVector(indices=sparse_indices, values=sparse_values),
+                        },
+                        payload=chunk.to_payload(),
+                    )
                 )
-            )
 
-        for start in range(0, len(points), batch_size):
-            self._client.upsert(
-                collection_name=self.collection,
-                points=points[start : start + batch_size],
-            )
+            for start in range(0, len(points), batch_size):
+                batch = points[start : start + batch_size]
+                self._client.upsert(
+                    collection_name=self.collection,
+                    points=batch,
+                )
+                inserted_ids.extend(str(point.id) for point in batch)
+        except Exception:
+            self._rollback_failed_upsert(texts=texts, inserted_ids=inserted_ids)
+            raise
 
         logger.info(f"[Qdrant] 已 upsert {len(points)} 个点（dense + sparse）")
+
+    def _rollback_failed_upsert(self, texts: List[str], inserted_ids: List[str]) -> None:
+        try:
+            self._sparse_encoder.remove_idf(texts)
+        except Exception as exc:
+            logger.warning(f"[Qdrant] upsert 回滚 IDF 失败: {exc}")
+
+        if not inserted_ids:
+            return
+
+        try:
+            try:
+                from qdrant_client.models import PointIdsList
+                points_selector = PointIdsList(points=inserted_ids)
+            except Exception:
+                points_selector = inserted_ids
+
+            self._client.delete(
+                collection_name=self.collection,
+                points_selector=points_selector,
+            )
+            logger.warning(f"[Qdrant] upsert 失败，已回滚 {len(inserted_ids)} 个已写入点")
+        except Exception as exc:
+            logger.warning(f"[Qdrant] upsert 部分写入回滚失败，请手动清理数据: {exc}")
 
     def _format_query_results(self, results: Any) -> List[Dict[str, Any]]:
         points = getattr(results, "points", results)

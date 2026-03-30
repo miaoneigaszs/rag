@@ -288,8 +288,24 @@ class RAGEngine:
         stats["dense_vector_count"] = len(dense_vectors)
 
         upsert_start = perf_counter()
-        self.vector_store.delete_by_source_path(resolved_path)
-        self.vector_store.upsert(chunks, dense_vectors)
+        try:
+            self.vector_store.delete_by_source_path(resolved_path)
+            self.vector_store.upsert(chunks, dense_vectors)
+        except Exception as exc:
+            logger.error(f"[Index] Upsert 失败: {exc}")
+            stats.update({
+                "status": "error",
+                "error": f"Upsert 失败: {exc}",
+                "upsert_ms": (perf_counter() - upsert_start) * 1000,
+                "total_ms": (perf_counter() - total_start) * 1000,
+            })
+            self._store_index_stats(stats)
+            return {
+                "status": "error",
+                "error": f"Upsert 失败: {exc}",
+                "source_file": source_file,
+                "source_path": resolved_path,
+            }
         stats["upsert_ms"] = (perf_counter() - upsert_start) * 1000
 
         result = {
