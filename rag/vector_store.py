@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -191,7 +192,7 @@ class QdrantVectorStore:
         self.embed_dim = embed_dim
         self.collection = cfg.collection_name
         self._client = self._build_client(cfg)
-        self._async_client = self._build_async_client(cfg)
+        self._async_client = None if cfg.mode == "local" else self._build_async_client(cfg)
         idf_path = os.getenv(
             "BM25_IDF_PATH",
             str(Path(cfg.path) / "bm25_idf") if cfg.mode == "local" else "./bm25_idf",
@@ -408,6 +409,14 @@ class QdrantVectorStore:
         score_threshold: float = 0.0,
         filter_conditions: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
+        if self._async_client is None:
+            return await asyncio.to_thread(
+                self.search_dense,
+                query_vector,
+                top_k,
+                score_threshold,
+                filter_conditions,
+            )
         if hasattr(self._async_client, "search"):
             results = await self._async_client.search(
                 collection_name=self.collection,
@@ -435,6 +444,8 @@ class QdrantVectorStore:
         top_k: int = 10,
         filter_conditions: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
+        if self._async_client is None:
+            return await asyncio.to_thread(self.search_sparse, query, top_k, filter_conditions)
         indices, values = self._sparse_encoder.encode(query)
         if not indices:
             return []

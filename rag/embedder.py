@@ -43,6 +43,12 @@ class EmbeddingService:
 
         logger.info(f"[Embedding] provider={cfg.provider}, model={self._model}, dim={cfg.dimension}")
 
+    def _prepare_text(self, text: str) -> str:
+        """裁剪超长 embedding 输入，避免触发上游服务的输入长度限制。"""
+        if len(text) <= self.cfg.max_input_chars:
+            return text
+        return text[: self.cfg.max_input_chars]
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -51,7 +57,8 @@ class EmbeddingService:
     )
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """同步批量生成向量，附带指数退避重试。"""
-        resp = self._client.embeddings.create(model=self._model, input=texts)
+        prepared = [self._prepare_text(text) for text in texts]
+        resp = self._client.embeddings.create(model=self._model, input=prepared)
         return [item.embedding for item in resp.data]
 
     def embed_all(self, texts: List[str], show_progress: bool = True) -> List[List[float]]:
@@ -68,7 +75,8 @@ class EmbeddingService:
 
     async def embed_batch_async(self, texts: List[str]) -> List[List[float]]:
         """异步批量生成向量。"""
-        resp = await self._async_client.embeddings.create(model=self._model, input=texts)
+        prepared = [self._prepare_text(text) for text in texts]
+        resp = await self._async_client.embeddings.create(model=self._model, input=prepared)
         return [item.embedding for item in resp.data]
 
     async def embed_single_async(self, text: str) -> List[float]:

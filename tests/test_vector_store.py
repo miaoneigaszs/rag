@@ -1,5 +1,6 @@
 """SparseEncoder 与 RRF 融合测试。"""
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -174,3 +175,42 @@ class TestQdrantUpsertRollback:
             assert first_chunk_id in [str(point_id) for point_id in selector.points]
         else:
             assert first_chunk_id in [str(point_id) for point_id in selector]
+
+
+class TestQdrantLocalAsyncFallback:
+    def test_local_mode_skips_async_client_initialization(self):
+        cfg = MagicMock()
+        cfg.mode = "local"
+        cfg.path = "./qdrant_data"
+        cfg.collection_name = "test_collection"
+
+        with (
+            patch.object(QdrantVectorStore, "_build_client", return_value=MagicMock()),
+            patch.object(QdrantVectorStore, "_build_async_client") as build_async,
+            patch.object(QdrantVectorStore, "_ensure_collection"),
+            patch("rag.vector_store.SparseEncoder"),
+        ):
+            store = QdrantVectorStore(cfg, 1024)
+
+        assert store._async_client is None
+        build_async.assert_not_called()
+
+    def test_async_search_dense_falls_back_to_sync_search_in_local_mode(self):
+        store = QdrantVectorStore.__new__(QdrantVectorStore)
+        store._async_client = None
+        store.search_dense = MagicMock(return_value=[{"id": "doc-1"}])
+
+        result = asyncio.run(store.async_search_dense([0.1, 0.2], top_k=3))
+
+        assert result == [{"id": "doc-1"}]
+        store.search_dense.assert_called_once_with([0.1, 0.2], 3, 0.0, None)
+
+    def test_async_search_sparse_falls_back_to_sync_search_in_local_mode(self):
+        store = QdrantVectorStore.__new__(QdrantVectorStore)
+        store._async_client = None
+        store.search_sparse = MagicMock(return_value=[{"id": "doc-2"}])
+
+        result = asyncio.run(store.async_search_sparse("fastapi", top_k=4))
+
+        assert result == [{"id": "doc-2"}]
+        store.search_sparse.assert_called_once_with("fastapi", 4, None)
