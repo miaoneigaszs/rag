@@ -46,3 +46,7 @@ rag/output.md
 # --- OS Specific ---
 .DS_Store
 Thumbs.db
+
+# --- Docs ---
+docs/
+.local_eval*
