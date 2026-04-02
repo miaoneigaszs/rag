@@ -48,9 +48,7 @@ local_eval_report.*
 rag_project_evaluation.md
 
 # --- Docs ---
-# docs 目录仅保留占位文件
-docs/*
-!docs/.gitkeep
+docs/
 
 # --- OS Specific ---
 .DS_Store
