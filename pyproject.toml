@@ -17,6 +17,11 @@ runtime = [
     "httpx>=0.28.1",
     "qdrant-client>=1.17.1",
 ]
+service = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "python-multipart>=0.0.20",
+]
 cache = [
     "diskcache>=5.6.3",
     "redis>=7.3.0",
@@ -39,6 +44,9 @@ all = [
     "openai>=2.29.0",
     "httpx>=0.28.1",
     "qdrant-client>=1.17.1",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "python-multipart>=0.0.20",
     "diskcache>=5.6.3",
     "redis>=7.3.0",
     "docling>=2.81.0",
