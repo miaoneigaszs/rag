@@ -54,7 +54,9 @@ class TestChunkConfig:
         with pytest.raises(ValueError, match="contextual_cache_backend"):
             ChunkConfig(contextual_cache_backend="s3")
 
-    def test_default_values(self):
+    def test_default_values(self, monkeypatch):
+        monkeypatch.delenv("USE_CONTEXTUAL_RETRIEVAL", raising=False)
+        monkeypatch.delenv("RAG_MODE", raising=False)
         cfg = ChunkConfig()
         assert cfg.chunk_size == 800
         assert cfg.chunk_overlap == 150

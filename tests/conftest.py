@@ -1,30 +1,22 @@
 """pytest 公共 fixture。"""
 
-import shutil
+import os
 from pathlib import Path
 import sys
 import uuid
 
 import pytest
 
+from rag.config import ChunkConfig, EmbeddingConfig, QdrantConfig, RAGConfig, RerankerConfig
+
+try:
+    from qdrant_client import QdrantClient
+except ImportError:
+    QdrantClient = None
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-
-@pytest.fixture()
-def tmp_path() -> Path:
-    """
-    自定义 tmp_path，绕开部分 Windows 环境中 pytest 内置 tmpdir 清理权限问题。
-    """
-    runtime_root = ROOT / "pytest_tmp_runtime"
-    runtime_root.mkdir(parents=True, exist_ok=True)
-    path = runtime_root / f"case_{uuid.uuid4().hex}"
-    path.mkdir(parents=True, exist_ok=False)
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -91,3 +83,61 @@ def sample_plain_text() -> str:
         "它应该被当作一个整体 section 处理。"
         "如果内容继续变长，再由递归切块逻辑进一步拆分。"
     )
+
+
+@pytest.fixture(scope="session")
+def docker_qdrant_endpoint() -> dict[str, int | str]:
+    if QdrantClient is None:
+        pytest.skip("qdrant-client is not installed")
+
+    host = os.getenv("RAG_TEST_QDRANT_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port_text = os.getenv("RAG_TEST_QDRANT_PORT", "6333").strip() or "6333"
+    try:
+        port = int(port_text)
+    except ValueError:
+        pytest.fail(f"Invalid RAG_TEST_QDRANT_PORT value: {port_text!r}")
+    client = QdrantClient(host=host, port=port, trust_env=False, check_compatibility=False)
+    try:
+        client.get_collections()
+    except Exception as exc:
+        pytest.skip(f"Docker Qdrant is unavailable: {exc}")
+    finally:
+        client.close()
+
+    return {"host": host, "port": port}
+
+
+@pytest.fixture()
+def docker_qdrant_config_factory(docker_qdrant_endpoint):
+    assert QdrantClient is not None
+
+    host = str(docker_qdrant_endpoint["host"])
+    port = int(docker_qdrant_endpoint["port"])
+    client = QdrantClient(host=host, port=port, trust_env=False, check_compatibility=False)
+    created_collections: list[str] = []
+
+    def factory(*, suffix: str, namespace: str = "default") -> tuple[RAGConfig, str]:
+        base_collection = f"rag_sdk_it_{suffix}_{uuid.uuid4().hex[:8]}"
+        created_collections.append(base_collection)
+        cfg = RAGConfig(
+            embedding=EmbeddingConfig(provider="proxy", proxy_api_key="", dimension=16),
+            reranker=RerankerConfig(api_key=""),
+            qdrant=QdrantConfig(
+                mode="docker",
+                host=host,
+                port=port,
+                collection_name=base_collection,
+            ),
+            chunk=ChunkConfig(use_contextual_retrieval=False, rag_mode="basic"),
+        )
+        return cfg, namespace
+
+    try:
+        yield factory
+    finally:
+        collections = [item.name for item in client.get_collections().collections]
+        for base_collection in created_collections:
+            for collection_name in collections:
+                if collection_name == base_collection or collection_name.startswith(f"{base_collection}__"):
+                    client.delete_collection(collection_name)
+        client.close()

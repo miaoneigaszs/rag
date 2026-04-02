@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,8 @@ except ImportError:
     logger = logging.getLogger(__name__)  # type: ignore
 
 
+_LOGICAL_SOURCE_URI_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
 class RAGEngine:
     """负责索引、检索、融合与重排的统一入口。"""
 
@@ -47,6 +50,7 @@ class RAGEngine:
         self._last_retrieval_stats: Dict[str, Any] = {}
 
     def _build_contextual(self) -> Optional[ContextualRetrieval]:
+        """上下文增强功能，如果启用，将基于章节内容为chunk添加上下文摘要"""
         if not self.cfg.chunk.use_contextual_retrieval:
             return None
         api_key = (
@@ -73,6 +77,12 @@ class RAGEngine:
         self._last_retrieval_stats = {}
 
     def _store_index_stats(self, stats: Dict[str, Any]) -> None:
+        """
+        存储索引过程的观测数据。
+
+        Args:
+            stats (Dict[str, Any]): 索引过程中的观测数据，如各种耗时、文档信息、chunk数量等。
+        """
         stats = dict(stats)
         stats.setdefault("total_ms", 0.0)
         self._last_index_stats = stats
@@ -106,6 +116,7 @@ class RAGEngine:
             stats.get("used_advanced_expansion", False),
         )
 
+    # 目前startup函数是冗余的，即不必要的，因为在创建RAGEngine实例时，自动创建了qdrant客户端，并确保了集合存在或被重新创建（_ensure_collection），未来startup可以做更多的预热或健康检查等启动逻辑。
     async def startup(self) -> None:
         if self._started:
             logger.warning("[RAGEngine] startup() 被重复调用，已忽略")
@@ -113,6 +124,7 @@ class RAGEngine:
         logger.info("[RAGEngine] 启动中...")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.vector_store.collection_info)
+        # collection_info函数会调用创建的qdrant客户端，返回collection中向量的数量
         self._started = True
         logger.info("[RAGEngine] 启动完成")
 
@@ -128,7 +140,7 @@ class RAGEngine:
 
         if self.contextual:
             try:
-                self.contextual.close()
+                self.contextual.close() # 这里关闭的是上下文增强功能的缓存，如redis
                 logger.info("[RAGEngine] Contextual cache 已关闭")
             except Exception as exc:
                 logger.warning(f"[RAGEngine] 关闭 Contextual cache 失败: {exc}")
@@ -145,49 +157,60 @@ class RAGEngine:
         file_path: str,
         extra_meta: Optional[Dict[str, Any]] = None,
         force_reindex: bool = False,
+        display_source_name: Optional[str] = None,
+        display_source_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """索引单个文件。"""
-        total_start = perf_counter()
-        resolved_path = str(Path(file_path).resolve())
-        source_file = Path(resolved_path).name
+        total_start = perf_counter() # 记录索引开始时间，perf_counter()比time.time()更精确，单位是秒
+        resolved_input_path = str(Path(file_path).resolve())
+        source_path = display_source_path or resolved_input_path
+        source_file = display_source_name or Path(source_path).name or Path(resolved_input_path).name
         upload_time = datetime.now(timezone.utc).isoformat()
         stats: Dict[str, Any] = {
             "source_file": source_file,
-            "source_path": resolved_path,
+            "source_path": source_path,
+            "input_path": resolved_input_path,
             "force_reindex": force_reindex,
             "contextual_enabled": bool(self.contextual),
-        }
+        } # input_path专门用来读，source_path是持久化存储的文件路径
 
-        doc_hash_start = perf_counter()
-        doc_id = self._compute_doc_hash(resolved_path)
-        stats["doc_hash_ms"] = (perf_counter() - doc_hash_start) * 1000
+        doc_id_start = perf_counter()  # 计算doc_id开始的时间
+        doc_id = self._compute_doc_id(source_path) # 使用哈希函数计算doc_id，生成文档的唯一标识符
+        stats["doc_id_ms"] = (perf_counter() - doc_id_start) * 1000 # 计算doc_id的耗时，单位是毫秒
         stats["doc_id"] = doc_id
 
+        content_hash_start = perf_counter()
+        content_hash = self._compute_content_hash(resolved_input_path) # 计算整个文档内容的哈希值
+        stats["content_hash_ms"] = (perf_counter() - content_hash_start) * 1000
+        stats["content_hash"] = content_hash
+
         exists_start = perf_counter()
-        already_exists = self.vector_store.doc_exists(doc_id)
+        already_exists = self.vector_store.doc_exists(doc_id) # 检查文档是否已索引入向量数据库
         stats["doc_exists_check_ms"] = (perf_counter() - exists_start) * 1000
         stats["doc_exists"] = already_exists
-        if not force_reindex and already_exists:
+        if not force_reindex and already_exists: # 如果没有设置强制重新索引，并且文档已经存在，跳过索引
             logger.info(f"[Index] 已跳过重复文件: {source_file} (doc_id={doc_id[:8]}...)")
             result = {
                 "status": "skipped",
                 "doc_id": doc_id,
+                "content_hash": content_hash,
                 "chunks": 0,
                 "source_file": source_file,
-                "source_path": resolved_path,
+                "source_path": source_path,
             }
             stats.update({
                 "status": "skipped",
                 "chunk_count": 0,
-                "total_ms": (perf_counter() - total_start) * 1000,
+                "total_ms": (perf_counter() - total_start) * 1000, # 计算索引的总耗时
             })
             self._store_index_stats(stats)
             return result
 
+        # 文档没有被索引过，开始解析文档内容
         logger.info(f"[Index] 开始解析: {source_file}")
         parse_start = perf_counter()
         try:
-            md_text, file_type = self.parser.parse(resolved_path)
+            md_text, file_type = self.parser.parse(resolved_input_path)
         except Exception as exc:
             logger.error(f"[Index] 解析失败: {exc}")
             stats.update({
@@ -201,7 +224,7 @@ class RAGEngine:
                 "status": "error",
                 "error": str(exc),
                 "source_file": source_file,
-                "source_path": resolved_path,
+                "source_path": source_path,
             }
         stats["parse_ms"] = (perf_counter() - parse_start) * 1000
         stats["file_type"] = file_type
@@ -220,11 +243,14 @@ class RAGEngine:
                 "status": "error",
                 "error": "解析结果为空",
                 "source_file": source_file,
-                "source_path": resolved_path,
+                "source_path": source_path,
             }
 
+        # 解析完成后，开始进行文档切块
+        logger.info(f"[Index] 开始切块: {source_file}")
+        
         chunk_start = perf_counter()
-        raw_chunks = self.splitter.split(md_text, source_file=source_file)
+        raw_chunks: List[Dict[str, Any]] = self.splitter.split(md_text, source_file=source_file) # 这里虽然上传了source_file，但当前切块器并未使用它
         stats["chunk_ms"] = (perf_counter() - chunk_start) * 1000
         stats["raw_chunk_count"] = len(raw_chunks)
         if not raw_chunks:
@@ -239,36 +265,38 @@ class RAGEngine:
                 "status": "error",
                 "error": "切块结果为空",
                 "source_file": source_file,
-                "source_path": resolved_path,
+                "source_path": source_path,
             }
 
         chunks: List[DocumentChunk] = [
-            DocumentChunk.create(
+            DocumentChunk.create( # 这个文档快里使用UUID创建了chunk_id
                 doc_id=doc_id,
                 content=raw["content"],
                 source_file=source_file,
-                source_path=resolved_path,
+                source_path=source_path,
                 file_type=file_type,
                 heading_path=raw["heading_path"],
                 chunk_index=raw["chunk_index"],
                 section_index=raw.get("section_index", -1),
                 upload_time=upload_time,
-                extra_meta=extra_meta or {},
+                extra_meta=extra_meta or {}, # 用户上传文档时添加的额外信息
             )
             for raw in raw_chunks
         ]
-        stats["chunk_count"] = len(chunks)
+        stats["chunk_count"] = len(chunks) # 其实这里chunk_count和raw_chunk_count一定是相等的
 
         contextual_start = perf_counter()
         if self.contextual:
-            chunks = self.contextual.enrich_chunks(chunks)
+            chunks = self.contextual.enrich_chunks(chunks) # 此时每个chunk里增加了一个属性context_prefix，描述了上下文信息
         stats["contextual_ms"] = (perf_counter() - contextual_start) * 1000
 
-        texts_for_embed = [chunk.full_text_for_embed for chunk in chunks]
+        # 切块完成，下一步进行向量嵌入
+        logger.info(f"[Index] 开始向量嵌入: {source_file}")
+        texts_for_embed = [chunk.full_text_for_embed for chunk in chunks] # 这里对chunk进行了丰富，包含了标题、上下文摘要（如果有context_prefix）和chunk原始内容，按照顺序拼接。
         stats["embedded_text_count"] = len(texts_for_embed)
         embed_start = perf_counter()
         try:
-            dense_vectors = self.embedder.embed_all(texts_for_embed)
+            dense_vectors: List[List[float]] = self.embedder.embed_all(texts_for_embed)
         except Exception as exc:
             logger.error(f"[Index] Embedding 失败: {exc}")
             stats.update({
@@ -282,37 +310,24 @@ class RAGEngine:
                 "status": "error",
                 "error": f"Embedding 失败: {exc}",
                 "source_file": source_file,
-                "source_path": resolved_path,
+                "source_path": source_path,
             }
         stats["embed_ms"] = (perf_counter() - embed_start) * 1000
         stats["dense_vector_count"] = len(dense_vectors)
 
+        # 向量嵌入完成，下一步进行向量存储
+        logger.info(f"[Index] 开始向量存储: {source_file}")
         upsert_start = perf_counter()
-        try:
-            self.vector_store.delete_by_source_path(resolved_path)
-            self.vector_store.upsert(chunks, dense_vectors)
-        except Exception as exc:
-            logger.error(f"[Index] Upsert 失败: {exc}")
-            stats.update({
-                "status": "error",
-                "error": f"Upsert 失败: {exc}",
-                "upsert_ms": (perf_counter() - upsert_start) * 1000,
-                "total_ms": (perf_counter() - total_start) * 1000,
-            })
-            self._store_index_stats(stats)
-            return {
-                "status": "error",
-                "error": f"Upsert 失败: {exc}",
-                "source_file": source_file,
-                "source_path": resolved_path,
-            }
+        self.vector_store.delete_by_source_path(source_path) # 设置了force_reindex=True，这里删除旧的向量
+        self.vector_store.upsert(chunks, dense_vectors)
         stats["upsert_ms"] = (perf_counter() - upsert_start) * 1000
 
         result = {
             "status": "ok",
             "doc_id": doc_id,
+            "content_hash": content_hash,
             "source_file": source_file,
-            "source_path": resolved_path,
+            "source_path": source_path,
             "file_type": file_type,
             "chunks": len(chunks),
         }
@@ -328,7 +343,7 @@ class RAGEngine:
         self,
         dir_path: str,
         extra_meta: Optional[Dict[str, Any]] = None,
-        glob_pattern: str = "**/*",
+        glob_pattern: str = "**/*", # **/* 表示递归目录所有文件，包括嵌套目录下的文件
         force_reindex: bool = False,
     ) -> List[Dict[str, Any]]:
         """批量索引目录下的所有支持文件。"""
@@ -347,7 +362,12 @@ class RAGEngine:
         return results
 
     def delete_file(self, file_identifier: str) -> None:
-        """按绝对路径/相对路径优先删除；必要时兼容旧的 basename 删除。"""
+        """按逻辑 source_path 优先删除；必要时兼容旧的 basename 删除。"""
+        if self._is_logical_source_path(file_identifier):
+            self.vector_store.delete_by_source_path(file_identifier)
+            logger.info(f"[Delete] 已按 logical source_path 删除: {file_identifier}")
+            return
+
         candidate = Path(file_identifier)
         looks_like_path = candidate.is_absolute() or candidate.parent != Path(".")
         if looks_like_path:
@@ -369,7 +389,7 @@ class RAGEngine:
     ) -> List[Dict[str, Any]]:
         """执行 Dense + Sparse 检索，经 RRF 融合后可选重排。"""
         total_start = perf_counter()
-        fetch_k = top_k * self.cfg.fetch_k_multiplier
+        fetch_k = top_k * self.cfg.fetch_k_multiplier # 检索相关度最高的top_k个向量
         stats: Dict[str, Any] = {
             "mode": "sync",
             "query": query,
@@ -377,14 +397,14 @@ class RAGEngine:
             "top_k": top_k,
             "fetch_k": fetch_k,
             "score_threshold": score_threshold or self.cfg.score_threshold,
-            "filter_conditions": deepcopy(filter_conditions) if filter_conditions else None,
+            "filter_conditions": deepcopy(filter_conditions) if filter_conditions else None, # 深拷贝，避免修改原始参数
             "skip_rerank": skip_rerank,
             "reranker_enabled": bool(self.reranker),
             "rag_mode": self.cfg.chunk.rag_mode,
         }
 
         embed_start = perf_counter()
-        query_vec = self.embedder.embed_single(query)
+        query_vec = self.embedder.embed_single(query) # 对查询进行稠密向量嵌入
         stats["query_embed_ms"] = (perf_counter() - embed_start) * 1000
 
         dense_start = perf_counter()
@@ -398,7 +418,7 @@ class RAGEngine:
         stats["dense_hit_count"] = len(dense_results)
 
         sparse_start = perf_counter()
-        sparse_results_raw = self.vector_store.search_sparse(
+        sparse_results_raw = self.vector_store.search_sparse( # 检索top_k个稀疏向量
             query=query,
             top_k=fetch_k,
             filter_conditions=filter_conditions,
@@ -407,10 +427,10 @@ class RAGEngine:
         stats["sparse_hit_count"] = len(sparse_results_raw)
         sparse_results: List[Tuple[str, float]] = [
             (result["id"], result["score"]) for result in sparse_results_raw
-        ]
+        ] # 这里只保留检索结果的id和score
 
         fusion_start = perf_counter()
-        fused = self._rrf_fusion(dense_results, sparse_results, fetch_k)
+        fused = self._rrf_fusion(dense_results, sparse_results, fetch_k) # 对_dense_results和_sparse_results进行RRF融合
         stats["fusion_ms"] = (perf_counter() - fusion_start) * 1000
         stats["fused_hit_count"] = len(fused)
         if not fused:
@@ -424,6 +444,7 @@ class RAGEngine:
             self._store_retrieval_stats(stats)
             return []
 
+        # 进行重排
         rerank_start = perf_counter()
         used_rerank = False
         if not skip_rerank and self.reranker and len(fused) > 1:
@@ -434,10 +455,12 @@ class RAGEngine:
         stats["rerank_ms"] = (perf_counter() - rerank_start) * 1000
         stats["used_rerank"] = used_rerank
 
+        # 格式化检索结果
         format_start = perf_counter()
         results = self._format_results(fused)
         stats["format_ms"] = (perf_counter() - format_start) * 1000
 
+        # 扩展语义节，如果配置为advanced模式，为每个chunk添加章节（同一section）的上下文信息
         section_expand_start = perf_counter()
         used_advanced_expansion = False
         if self.cfg.chunk.rag_mode == "advanced":
@@ -453,6 +476,7 @@ class RAGEngine:
         return results
 
     async def index_file_async(self, file_path: str, **kwargs: Any) -> Dict[str, Any]:
+        """异步索引文件，返回索引结果。"""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: self.index_file(file_path, **kwargs))
 
@@ -485,6 +509,7 @@ class RAGEngine:
         stats["query_embed_ms"] = (perf_counter() - embed_start) * 1000
 
         async def _dense() -> List[Dict[str, Any]]:
+            """异步密集检索，返回密集检索结果。"""
             return await self.vector_store.async_search_dense(
                 query_vector=query_vec,
                 top_k=fetch_k,
@@ -493,6 +518,7 @@ class RAGEngine:
             )
 
         async def _sparse() -> List[Dict[str, Any]]:
+            """异步稀疏检索，返回稀疏检索结果。"""
             return await self.vector_store.async_search_sparse(
                 query=query,
                 top_k=fetch_k,
@@ -555,7 +581,6 @@ class RAGEngine:
     def _expand_sections(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """按 doc_id + section_index 将命中 chunk 扩展为完整 section 文本。"""
         section_cache: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
-
         for result in results:
             doc_id = result.get("doc_id", "")
             section_index = result.get("section_index", -1)
@@ -588,7 +613,7 @@ class RAGEngine:
         sparse_results: List[Tuple[str, float]],
         top_k: int,
     ) -> List[Dict[str, Any]]:
-        """Reciprocal Rank Fusion: score(doc) = Σ 1 / (k + rank_i)。"""
+        """将密集检索结果和稀疏检索结果进行融合，返回融合后的结果。"""
         rrf_k = self.cfg.rrf_k
         scores: Dict[str, float] = {}
         id_to_payload: Dict[str, Dict[str, Any]] = {}
@@ -620,6 +645,7 @@ class RAGEngine:
         ]
 
     def _rerank(self, query: str, candidates: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+        """对候选文档进行重排。"""
         assert self.reranker is not None
         documents = self._build_rerank_docs(candidates)
         rerank_results = self.reranker.rerank(query, documents, top_n=top_k)
@@ -634,6 +660,7 @@ class RAGEngine:
         candidates: List[Dict[str, Any]],
         top_k: int,
     ) -> List[Dict[str, Any]]:
+        """异步对候选文档进行重排。"""
         assert self.reranker is not None
         documents = self._build_rerank_docs(candidates)
         rerank_results = await self.reranker.async_rerank(query, documents, top_n=top_k)
@@ -644,6 +671,7 @@ class RAGEngine:
 
     @staticmethod
     def _build_rerank_docs(candidates: List[Dict[str, Any]]) -> List[str]:
+        """为候选文档添加标题前缀，提高重排效果。"""
         docs = []
         for item in candidates:
             heading_str = item["payload"].get("heading_str", "")
@@ -656,6 +684,7 @@ class RAGEngine:
         candidates: List[Dict[str, Any]],
         rerank_results: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """应用重排结果到候选文档，返回重排后的结果。"""
         reranked = []
         for result in rerank_results:
             idx = result.get("index", 0)
@@ -667,6 +696,7 @@ class RAGEngine:
 
     @staticmethod
     def _format_results(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """格式化检索结果，保留必要的字段。"""
         output = []
         for item in items:
             payload = item.get("payload", {})
@@ -690,6 +720,7 @@ class RAGEngine:
         return output
 
     def format_results_for_llm(self, results: List[Dict[str, Any]]) -> str:
+        """格式化检索结果，准备输入到 LLM。"""
         if not results:
             return "未检索到任何结果。"
         parts = []
@@ -697,17 +728,31 @@ class RAGEngine:
             header = f"[{index}] 来源: {result['source_file']}"
             if result["heading_str"]:
                 header += f" | 标题: {result['heading_str']}"
-            header += f" | 分数: {result['score']:.4f}"
             body = result.get("section_context") or result["content"]
             parts.append(f"{header}\n{body}")
         return "\n\n---\n\n".join(parts)
 
     def collection_stats(self) -> Dict[str, Any]:
+        """获取当前索引的统计信息。"""
         return self.vector_store.collection_info()
 
+    def list_source_paths_by_source_file(self, source_file: str) -> List[str]:
+        """根据 source文件路径获取所有文档路径。"""
+        return self.vector_store.list_source_paths_by_source_file(source_file)
+
     @staticmethod
-    def _compute_doc_hash(file_path: str) -> str:
-        """基于文件内容计算稳定 doc_id。"""
+    def _is_logical_source_path(file_identifier: str) -> bool:
+        """判断文件标识是否为逻辑源路径。"""
+        return bool(_LOGICAL_SOURCE_URI_RE.match(file_identifier))
+
+    @staticmethod
+    def _compute_doc_id(source_path: str) -> str:
+        """基于稳定 source_path 计算文档资源标识。"""
+        return hashlib.sha256(source_path.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _compute_content_hash(file_path: str) -> str:
+        """基于文件内容计算稳定内容哈希，用于观测与幂等分析。"""
         digest = hashlib.sha256()
         with open(file_path, "rb") as file_obj:
             for chunk in iter(lambda: file_obj.read(65536), b""):
@@ -759,3 +804,6 @@ def create_rag_engine(
         ),
     )
     return RAGEngine(cfg)
+
+
+

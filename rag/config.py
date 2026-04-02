@@ -42,7 +42,6 @@ class EmbeddingConfig:
     provider: str = field(default_factory=lambda: os.getenv("EMBED_PROVIDER", "proxy"))
     dimension: int = field(default_factory=lambda: int(os.getenv("EMBED_DIM", "1024")))
     batch_size: int = 32
-    max_input_chars: int = field(default_factory=lambda: int(os.getenv("EMBED_MAX_CHARS", "450")))
 
     def __post_init__(self) -> None:
         if self.provider not in ("openai", "proxy"):
@@ -51,10 +50,6 @@ class EmbeddingConfig:
             raise ValueError(f"EmbeddingConfig.dimension 必须为正整数: {self.dimension}")
         if self.batch_size <= 0:
             raise ValueError(f"EmbeddingConfig.batch_size 必须为正整数: {self.batch_size}")
-        if self.max_input_chars <= 0:
-            raise ValueError(
-                f"EmbeddingConfig.max_input_chars 必须为正整数: {self.max_input_chars}"
-            )
 
 
 @dataclass

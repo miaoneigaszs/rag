@@ -7,7 +7,6 @@ rag/parser.py
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -50,15 +49,6 @@ class DocumentParser:
     PLAIN_TEXT_TYPES = frozenset(
         {".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".log"}
     )
-
-    def __init__(self) -> None:
-        self._vision_enabled = os.getenv("VISION_ENABLED", "false").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        self._vision_timeout = float(os.getenv("VISION_TIMEOUT_SECONDS", "15"))
 
     @property
     def supported_extensions(self) -> frozenset[str]:
@@ -116,9 +106,7 @@ class DocumentParser:
     def _get_image_caption(self, image_bytes: bytes) -> str:
         """调用多模态模型生成图片描述"""
         try:
-            if not self._vision_enabled:
-                return ""
-
+            import os
             import base64
             from openai import OpenAI
 
@@ -127,10 +115,9 @@ class DocumentParser:
             model = os.getenv("VISION_MODEL", "gpt-4o-mini")
 
             if not api_key:
-                logger.info("[Parser] 未配置 Vision API Key，跳过图片描述")
-                return ""
+                return "未配置 Vision API Key，跳过图片描述。"
 
-            client = OpenAI(api_key=api_key, base_url=base_url, timeout=self._vision_timeout)
+            client = OpenAI(api_key=api_key, base_url=base_url)
             base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
             response = client.chat.completions.create(
@@ -154,7 +141,7 @@ class DocumentParser:
             return response.choices[0].message.content or "未提取到有效描述"
         except Exception as e:
             logger.warning(f"多模态模型调用失败: {e}")
-            return ""
+            return "图片描述提取失败"
 
     def _parse_with_docling(self, file_path: str) -> Optional[str]:
         """使用 Docling 解析，返回 Markdown 文本；支持图片提取和多模态描述。"""
@@ -212,16 +199,11 @@ class DocumentParser:
                             img_bytes = buffered.getvalue()
 
                             caption = self._get_image_caption(img_bytes)
-                            if caption:
-                                replacement = (
-                                    f"\n\n> 🖼️ **图片内容信息** ({img_filename}):\n"
-                                    f"> {caption}\n"
-                                    f"> (图片本地路径: `{img_path.resolve()}`)\n\n"
-                                )
-                            else:
-                                replacement = (
-                                    f"\n\n> 🖼️ 图片已提取: `{img_path.resolve()}`\n\n"
-                                )
+                            replacement = (
+                                f"\n\n> 🖼️ **图片内容信息** ({img_filename}):\n"
+                                f"> {caption}\n"
+                                f"> (图片本地路径: `{img_path.resolve()}`)\n\n"
+                            )
                         else:
                             # 取到了 PictureItem 但无图像数据，用空白替换占位符
                             replacement = ""

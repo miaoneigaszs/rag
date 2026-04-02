@@ -33,6 +33,8 @@ env/
 # --- RAG Project Data & Caches ---
 # 向量数据库本地存储 (Qdrant)
 qdrant_data/
+# 本地评测数据和缓存
+.local_eval_qdrant/
 # Contextual Retrieval 摘要缓存 (DiskCache)
 contextual_cache/
 # BM25 持久化统计
@@ -42,11 +44,14 @@ bm25_idf*
 # 本地解析输出产物
 rag/Output_Markdown/
 rag/output.md
+local_eval_report.*
+rag_project_evaluation.md
+
+# --- Docs ---
+# docs 目录仅保留占位文件
+docs/*
+!docs/.gitkeep
 
 # --- OS Specific ---
 .DS_Store
 Thumbs.db
-
-# --- Docs ---
-docs/
-.local_eval*

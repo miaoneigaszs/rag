@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import math
@@ -128,6 +127,7 @@ class SparseEncoder:
         self._save_idf_state()
 
     def update_idf(self, texts: List[str]) -> None:
+        """更新 IDF 统计信息。"""
         with self._lock:
             self._apply_texts(texts, direction=1)
         logger.debug(
@@ -135,6 +135,7 @@ class SparseEncoder:
         )
 
     def remove_idf(self, texts: List[str]) -> None:
+        """回滚（移除）给定文本对 IDF 的影响。"""
         with self._lock:
             self._apply_texts(texts, direction=-1)
         logger.debug(
@@ -148,6 +149,7 @@ class SparseEncoder:
         return math.log((self._doc_count - df + 0.5) / (df + 0.5) + 1)
 
     def encode(self, text: str) -> Tuple[List[int], List[float]]:
+        """将文本编码为稀疏向量 (indices, values)。"""
         tokens = self._tokenize(text)
         if not tokens:
             return [], []
@@ -192,7 +194,7 @@ class QdrantVectorStore:
         self.embed_dim = embed_dim
         self.collection = cfg.collection_name
         self._client = self._build_client(cfg)
-        self._async_client = None if cfg.mode == "local" else self._build_async_client(cfg)
+        self._async_client = self._build_async_client(cfg)
         idf_path = os.getenv(
             "BM25_IDF_PATH",
             str(Path(cfg.path) / "bm25_idf") if cfg.mode == "local" else "./bm25_idf",
@@ -261,65 +263,30 @@ class QdrantVectorStore:
         dense_vectors: List[List[float]],
         batch_size: int = 64,
     ) -> None:
-        if len(chunks) != len(dense_vectors):
-            raise ValueError("chunks 与 dense_vectors 长度不一致，无法 upsert")
-        if not chunks:
-            return
+        """执行向量的插入或更新。"""
+        self._sparse_encoder.update_idf([chunk.content for chunk in chunks])
 
-        texts = [chunk.content for chunk in chunks]
-        self._sparse_encoder.update_idf(texts)
         points: List[Any] = []
-        inserted_ids: List[str] = []
-        try:
-            for chunk, dense_vec in zip(chunks, dense_vectors):
-                sparse_indices, sparse_values = self._sparse_encoder.encode(chunk.content)
-                points.append(
-                    PointStruct(
-                        id=chunk.chunk_id,
-                        vector={
-                            _DENSE_VECTOR_NAME: dense_vec,
-                            _SPARSE_VECTOR_NAME: SparseVector(indices=sparse_indices, values=sparse_values),
-                        },
-                        payload=chunk.to_payload(),
-                    )
+        for chunk, dense_vec in zip(chunks, dense_vectors):
+            sparse_indices, sparse_values = self._sparse_encoder.encode(chunk.content)
+            points.append(
+                PointStruct(
+                    id=chunk.chunk_id,
+                    vector={
+                        _DENSE_VECTOR_NAME: dense_vec,
+                        _SPARSE_VECTOR_NAME: SparseVector(indices=sparse_indices, values=sparse_values),
+                    },
+                    payload=chunk.to_payload(),
                 )
+            )
 
-            for start in range(0, len(points), batch_size):
-                batch = points[start : start + batch_size]
-                self._client.upsert(
-                    collection_name=self.collection,
-                    points=batch,
-                )
-                inserted_ids.extend(str(point.id) for point in batch)
-        except Exception:
-            self._rollback_failed_upsert(texts=texts, inserted_ids=inserted_ids)
-            raise
+        for start in range(0, len(points), batch_size):
+            self._client.upsert(
+                collection_name=self.collection,
+                points=points[start : start + batch_size],
+            )
 
         logger.info(f"[Qdrant] 已 upsert {len(points)} 个点（dense + sparse）")
-
-    def _rollback_failed_upsert(self, texts: List[str], inserted_ids: List[str]) -> None:
-        try:
-            self._sparse_encoder.remove_idf(texts)
-        except Exception as exc:
-            logger.warning(f"[Qdrant] upsert 回滚 IDF 失败: {exc}")
-
-        if not inserted_ids:
-            return
-
-        try:
-            try:
-                from qdrant_client.models import PointIdsList
-                points_selector = PointIdsList(points=inserted_ids)
-            except Exception:
-                points_selector = inserted_ids
-
-            self._client.delete(
-                collection_name=self.collection,
-                points_selector=points_selector,
-            )
-            logger.warning(f"[Qdrant] upsert 失败，已回滚 {len(inserted_ids)} 个已写入点")
-        except Exception as exc:
-            logger.warning(f"[Qdrant] upsert 部分写入回滚失败，请手动清理数据: {exc}")
 
     def _format_query_results(self, results: Any) -> List[Dict[str, Any]]:
         points = getattr(results, "points", results)
@@ -332,6 +299,7 @@ class QdrantVectorStore:
         score_threshold: float = 0.0,
         filter_conditions: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
+        """执行 Dense 检索，可选过滤条件。"""
         if hasattr(self._client, "search"):
             results = self._client.search(
                 collection_name=self.collection,
@@ -359,6 +327,7 @@ class QdrantVectorStore:
         top_k: int = 10,
         filter_conditions: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
+        """执行 Sparse 检索，可选过滤条件。"""
         indices, values = self._sparse_encoder.encode(query)
         if not indices:
             return []
@@ -385,6 +354,7 @@ class QdrantVectorStore:
         return self._format_query_results(results)
 
     def fetch_by_section(self, doc_id: str, section_index: int) -> List[Dict[str, Any]]:
+        """根据文档 ID 和章节索引获取当前章节下的所有文本块。"""
         if section_index == -1:
             return []
         results = self._scroll_all(
@@ -409,14 +379,6 @@ class QdrantVectorStore:
         score_threshold: float = 0.0,
         filter_conditions: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        if self._async_client is None:
-            return await asyncio.to_thread(
-                self.search_dense,
-                query_vector,
-                top_k,
-                score_threshold,
-                filter_conditions,
-            )
         if hasattr(self._async_client, "search"):
             results = await self._async_client.search(
                 collection_name=self.collection,
@@ -444,8 +406,6 @@ class QdrantVectorStore:
         top_k: int = 10,
         filter_conditions: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        if self._async_client is None:
-            return await asyncio.to_thread(self.search_sparse, query, top_k, filter_conditions)
         indices, values = self._sparse_encoder.encode(query)
         if not indices:
             return []
@@ -472,10 +432,21 @@ class QdrantVectorStore:
         return self._format_query_results(results)
 
     def fetch_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
+        """根据点 ID 列表批量获取对应的 payload 数据。"""
         results = self._client.retrieve(collection_name=self.collection, ids=ids, with_payload=True)
         return [{"id": str(result.id), "payload": result.payload} for result in results]
 
+    def list_source_paths_by_source_file(self, source_file: str) -> List[str]:
+        """根据source_file查询所有source_path。"""
+        points = self._scroll_all(
+            Filter(must=[FieldCondition(key="source_file", match=MatchValue(value=source_file))]),
+            with_payload=True,
+        )
+        source_paths = {str(point.payload.get("source_path", "")) for point in points if point.payload}
+        return sorted(path for path in source_paths if path)
+
     def doc_exists(self, doc_id: str) -> bool:
+        """在向量数据库中检索doc_id对应的向量，来判断该文档是否已索引入向量数据库。"""
         results, _ = self._client.scroll(
             collection_name=self.collection,
             scroll_filter=Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]),
@@ -485,12 +456,14 @@ class QdrantVectorStore:
         return len(results) > 0
 
     def delete_by_doc_id(self, doc_id: str) -> None:
+        """删除指定 doc_id 对应的所有向量。"""
         self._delete_by_filter(
             Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]),
             log_label=f"doc_id={doc_id[:8]}...",
         )
 
     def delete_by_source_path(self, source_path: str) -> None:
+        """删除指定source_path对应的向量。"""
         self._delete_by_filter(
             Filter(must=[FieldCondition(key="source_path", match=MatchValue(value=source_path))]),
             log_label=f"source_path={source_path}",
@@ -503,6 +476,7 @@ class QdrantVectorStore:
         )
 
     def collection_info(self) -> Dict[str, Any]:
+        """获取向量数据库中指定集合的统计信息。"""
         info = self._client.get_collection(self.collection)
         vectors_count = getattr(info, "vectors_count", None)
         if vectors_count is None:
