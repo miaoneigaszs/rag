@@ -79,3 +79,9 @@ ignore = ["E501"]
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that exercise real external dependencies or multi-component flows",
+    "docker_qdrant: tests that require a reachable Docker-backed Qdrant server",
+]

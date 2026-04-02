@@ -316,8 +316,8 @@ def create_app(
     @app.post(
         "/documents/index",
         response_model=SuccessResponse[IndexDocumentResponseData],
-        summary="提取路径并索引该文件",
-        description="对传入的服务端文件路径进行索引，并收录在解析出的命名空间中。返回结果包含该文件的 canonical source_path（规范资源标识），供后续进行检索和删除时指定。",
+        summary="Index a file by path",
+        description="Index a server-side file path into the resolved namespace. The returned data includes the file's canonical source_path for later retrieval and deletion.",
     )
     async def index_document(
         payload: IndexDocumentRequest,
@@ -337,8 +337,8 @@ def create_app(
     @app.post(
         "/documents/upload",
         response_model=SuccessResponse[IndexDocumentResponseData],
-        summary="上传并在本地索引文档",
-        description="上传指定文档被引擎赋予固定的 source_path 格式如 bytes://api-upload/<filename>，它会被索引进对应的命名空间中。所有带有 sdk_source_* 等敏感前缀保留配置将直接以 400 被拒绝。",
+        summary="Upload and index a document",
+        description="Upload a document and index it in the target namespace. The resulting canonical source_path uses the fixed bytes://api-upload/<filename> form. Any metadata keys with sdk_source_* prefixes are rejected with HTTP 400.",
     )
     async def upload_document(
         request: Request,
@@ -403,8 +403,8 @@ def create_app(
     @app.post(
         "/documents/delete",
         response_model=SuccessResponse[DeleteDocumentResponseData],
-        summary="删除索引对应的资源实体",
-        description="按照严格的规范 source_path 或旧版的 basename 发起针对性资源剔除工作。最终结果中的 request_identifier 将回调展现客户端原始输入；而 resolved_source_paths 将列支所有最终命中删除对象的准确实体源名称。当并且仅当唯一的具体资源能被精准定向移除时，它才会包含单一的 source_path 实参。",
+        summary="Delete indexed resources",
+        description="Delete indexed resources using a strict source_path or legacy basename. request_identifier echoes the original client input, resolved_source_paths lists every canonical resource matched for deletion, and source_path is only present when exactly one canonical resource matched.",
     )
     async def delete_document(
         payload: DeleteDocumentRequest,
