@@ -162,9 +162,3 @@ cases = load_eval_cases("path/to/eval_dataset.jsonl")
 summary = evaluate_engine(engine, cases, top_k=5)
 print(summary.to_dict())
 ```
-
-## 版本管理建议
-
-这个仓库建议按功能分支开发：先从 `main` 拉出分支，改完后先看 `git status` 和 `git diff --stat`，再提交、推送、合并。
-
-如果你不确定某个文件是否该提交，优先把它归类为：源码、可复现配置、生成物或本地缓存。前两类可以进仓库，后两类不要进。
