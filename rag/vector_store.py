@@ -25,6 +25,7 @@ try:
         NamedVector,
         OptimizersConfigDiff,
         PayloadSchemaType,
+        PointIdsList,
         PointStruct,
         SparseIndexParams,
         SparseVector,
@@ -33,11 +34,22 @@ try:
     )
     _HAS_QDRANT = True
 except ImportError:
+    class _QdrantFallbackModel:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.__dict__.update(kwargs)
+
+    class _QdrantFallbackEnum:
+        COSINE = "COSINE"
+        KEYWORD = "KEYWORD"
+        INTEGER = "INTEGER"
+
     AsyncQdrantClient = None  # type: ignore[assignment]
     QdrantClient = None  # type: ignore[assignment]
-    Distance = FieldCondition = Filter = HnswConfigDiff = MatchAny = MatchValue = None  # type: ignore[assignment]
-    NamedSparseVector = NamedVector = OptimizersConfigDiff = PayloadSchemaType = None  # type: ignore[assignment]
-    PointStruct = SparseIndexParams = SparseVector = SparseVectorParams = VectorParams = None  # type: ignore[assignment]
+    Distance = _QdrantFallbackEnum  # type: ignore[assignment]
+    FieldCondition = Filter = HnswConfigDiff = MatchAny = MatchValue = _QdrantFallbackModel  # type: ignore[assignment]
+    NamedSparseVector = NamedVector = OptimizersConfigDiff = PayloadSchemaType = _QdrantFallbackModel  # type: ignore[assignment]
+    PointIdsList = PointStruct = SparseIndexParams = SparseVector = SparseVectorParams = VectorParams = _QdrantFallbackModel  # type: ignore[assignment]
     _HAS_QDRANT = False
 
 from .config import QdrantConfig
@@ -187,9 +199,6 @@ class QdrantVectorStore:
     """Qdrant 向量存储，支持 dense + sparse 双路检索。"""
 
     def __init__(self, cfg: QdrantConfig, embed_dim: int) -> None:
-        if not _HAS_QDRANT:
-            raise ImportError("缺少 qdrant-client 依赖: pip install qdrant-client")
-
         self.cfg = cfg
         self.embed_dim = embed_dim
         self.collection = cfg.collection_name
@@ -204,6 +213,8 @@ class QdrantVectorStore:
 
     @staticmethod
     def _build_client(cfg: QdrantConfig):
+        if QdrantClient is None:
+            raise ImportError("缺少 qdrant-client 依赖: pip install qdrant-client")
         if cfg.mode == "local":
             Path(cfg.path).mkdir(parents=True, exist_ok=True)
             logger.info(f"[Qdrant] 使用本地模式: {cfg.path}")
@@ -216,6 +227,8 @@ class QdrantVectorStore:
 
     @staticmethod
     def _build_async_client(cfg: QdrantConfig):
+        if AsyncQdrantClient is None:
+            raise ImportError("缺少 qdrant-client 依赖: pip install qdrant-client")
         if cfg.mode == "local":
             return AsyncQdrantClient(path=cfg.path)
         if cfg.mode == "docker":
@@ -264,27 +277,46 @@ class QdrantVectorStore:
         batch_size: int = 64,
     ) -> None:
         """执行向量的插入或更新。"""
-        self._sparse_encoder.update_idf([chunk.content for chunk in chunks])
+        texts = [chunk.content for chunk in chunks]
+        self._sparse_encoder.update_idf(texts)
 
         points: List[Any] = []
-        for chunk, dense_vec in zip(chunks, dense_vectors):
-            sparse_indices, sparse_values = self._sparse_encoder.encode(chunk.content)
-            points.append(
-                PointStruct(
-                    id=chunk.chunk_id,
-                    vector={
-                        _DENSE_VECTOR_NAME: dense_vec,
-                        _SPARSE_VECTOR_NAME: SparseVector(indices=sparse_indices, values=sparse_values),
-                    },
-                    payload=chunk.to_payload(),
+        inserted_ids: List[str] = []
+        try:
+            for chunk, dense_vec in zip(chunks, dense_vectors):
+                sparse_indices, sparse_values = self._sparse_encoder.encode(chunk.content)
+                points.append(
+                    PointStruct(
+                        id=chunk.chunk_id,
+                        vector={
+                            _DENSE_VECTOR_NAME: dense_vec,
+                            _SPARSE_VECTOR_NAME: SparseVector(indices=sparse_indices, values=sparse_values),
+                        },
+                        payload=chunk.to_payload(),
+                    )
                 )
-            )
 
-        for start in range(0, len(points), batch_size):
-            self._client.upsert(
-                collection_name=self.collection,
-                points=points[start : start + batch_size],
-            )
+            for start in range(0, len(points), batch_size):
+                batch = points[start : start + batch_size]
+                self._client.upsert(
+                    collection_name=self.collection,
+                    points=batch,
+                )
+                inserted_ids.extend(str(point.id) for point in batch)
+        except Exception:
+            if inserted_ids:
+                try:
+                    self._client.delete(
+                        collection_name=self.collection,
+                        points_selector=PointIdsList(points=inserted_ids),
+                    )
+                except Exception as rollback_exc:
+                    logger.warning(f"[Qdrant] 回滚已写入点失败: {rollback_exc}")
+            try:
+                self._sparse_encoder.remove_idf(texts)
+            except Exception as rollback_exc:
+                logger.warning(f"[Qdrant] 回滚 IDF 失败: {rollback_exc}")
+            raise
 
         logger.info(f"[Qdrant] 已 upsert {len(points)} 个点（dense + sparse）")
 
