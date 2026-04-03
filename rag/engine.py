@@ -804,6 +804,3 @@ def create_rag_engine(
         ),
     )
     return RAGEngine(cfg)
-
-
-

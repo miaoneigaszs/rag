@@ -32,13 +32,11 @@ from .models import (
 _DEFAULT_NAMESPACE = "default"
 _NAMESPACE_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
-
 async def maybe_await(value: Any) -> Any:
     """统一处理同步值和异步协程，如果值是可等待对象则等待执行，否则直接返回。"""
     if inspect.isawaitable(value):
         return await value
     return value
-
 
 class AgentKnowledgeService:
     """RAG 核心引擎之上的稳定服务边界。
